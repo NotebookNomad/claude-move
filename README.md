@@ -114,3 +114,7 @@ python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
 The suite builds a synthetic `~/.claude` mirroring the real layout and checks
 the full migration, subprojects, merging, blockers, and `--dry-run` being
 read-only. Your real `~/.claude` is never touched.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
