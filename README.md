@@ -87,6 +87,19 @@ full plan and touches nothing.
 state directory*. If the project being moved collides with another, the script
 warns before doing anything — the other project's transcripts will move too.
 
+## Tests
+
+```bash
+python3 tests/test_claude_move.py            # temp dir, cleaned up
+python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
+```
+
+45 assertions over a synthetic `~/.claude` built to mirror the real layout:
+the full migration, subprojects, `--merge`, `--dry-run` being read-only, the
+live-session and fatal blockers, already-moved detection, `--list`, and a
+JSON-escaped non-ASCII path. Your real `~/.claude` is never touched — the tool
+is always invoked with `--claude-dir`/`--config` pointed at the fixture.
+
 ## After the move
 
 ```bash
