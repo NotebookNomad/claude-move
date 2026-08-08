@@ -1,0 +1,6 @@
+# machine-local Claude Code permissions
+.claude/settings.local.json
+
+__pycache__/
+*.py[cod]
+.DS_Store
