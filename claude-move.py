@@ -16,10 +16,9 @@ where <encoded-path> is the absolute path with every non-alphanumeric
 character replaced by "-".  Moving a project with `mv` alone orphans all of
 it: Claude starts the new location with empty memory and no permissions.
 
-This script performs the move and rewrites every reference.  Rather than
-enumerating the state files it knows about (a list that goes stale every time
-Claude Code grows a new directory), it scans ~/.claude for files that mention
-the old path and rewrites those.
+This script performs the move and rewrites every reference.  The files to
+update are found by scanning ~/.claude for the old path, so state belonging to
+Claude Code versions newer than this script is covered too.
 
 Usage:
     claude-move.py /old/path /new/path            # move files + state

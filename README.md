@@ -1,110 +1,116 @@
 # claude-move
 
-Move or rename a project directory and carry its Claude Code state with it.
+Move or rename a project directory without losing its Claude Code state.
 
-Claude Code keys everything off the project's **absolute path**. `mv` alone
-orphans all of it — the new location starts with empty memory, no permissions,
-no session history:
+Claude Code stores a project's memory, permissions and session history outside
+the project folder, keyed by the project's **absolute path**. Move the folder
+with `mv` and none of it follows: the new location starts with empty memory, no
+permissions, and no past sessions.
 
-| State | Location | Keyed by |
-| --- | --- | --- |
-| Session transcripts | `~/.claude/projects/<encoded-path>/*.jsonl` | path |
-| Memory files | `~/.claude/projects/<encoded-path>/memory/` | path |
-| Permissions, MCP servers, trust | `~/.claude.json` → `projects["<abs path>"]` | path |
-| Prompt history | `~/.claude/history.jsonl` | path |
-| File backups (rewind) | `~/.claude/file-history/<session-id>/` | `sha256(path)[:16]` |
-| Background job state | `~/.claude/jobs/<id>/state.json` | path |
-| Per-session env | `~/.claude/session-env/<session-id>/` | session id |
+`claude-move` performs the move and updates everything that referred to the old
+path.
 
-`<encoded-path>` is the absolute path with every non-alphanumeric character
-replaced by `-`, so `/Users/me/dev/my_app` → `-Users-me-dev-my-app`.
-
-## Usage
+## Quick start
 
 ```bash
-./claude-move.py ~/dev/api ~/work/api-server     # move + rename, state follows
-./claude-move.py ~/dev/api ~/work/api --dry-run  # show the plan, change nothing
-./claude-move.py ~/dev/api ~/work/api --state-only   # folder already moved by hand
-./claude-move.py --list                          # list known projects
+git clone https://github.com/NotebookNomad/claude-move.git
+cd claude-move
+
+./claude-move.py --list                                  # what does Claude know about?
+./claude-move.py ~/dev/api ~/work/api-server --dry-run    # show the plan, change nothing
+./claude-move.py ~/dev/api ~/work/api-server              # do it
 ```
 
-Renaming is just a move to a different final path — `~/dev/api` → `~/dev/backend`
-works the same way.
+Then pick up where you left off:
 
-Stdlib-only Python 3.8+, no dependencies. Run `--dry-run` first; it prints the
-full plan and touches nothing.
+```bash
+cd ~/work/api-server && claude --continue
+```
 
-## What it does
+Renaming is the same operation — `~/dev/api` → `~/dev/backend` works exactly
+like a move.
 
-1. Moves the project folder (skipped with `--state-only`, or automatically if
-   the folder is already at the destination).
-2. Moves `~/.claude/projects/<old>/` → `<new>/`, transcripts and `memory/` intact.
-3. Renames the `~/.claude.json` `projects` key, keeping `allowedTools`,
-   `mcpServers`, trust flags and stats.
-4. Rewrites every embedded reference — transcript `cwd`, tool calls and outputs
-   quoting the old path, memory file bodies, `history.jsonl` project tags,
-   `~/` shorthand forms, and the encoded directory name where it appears in
-   scratchpad paths.
+Single file, Python 3.8+, standard library only. Nothing to install.
 
-   These files are found by **scanning** `~/.claude` for the old path rather
-   than by an allowlist of state files, so directories a future Claude Code
-   version adds are covered without a code change. (An allowlist had already
-   gone stale: it missed `jobs/<id>/state.json`, which stores a `cwd`.) Skipped
-   during the scan: `projects/` (moved explicitly), `file-history/` (blobs are
-   verbatim copies of *your* files — only their names encode a path), and this
-   tool's own backups. `--dry-run` lists every file it matched, so you can see
-   the exact set before anything happens — including Claude's own
-   `backups/.claude.json.backup.*`, which are rewritten so that rolling one
-   back doesn't resurrect dead paths.
-5. Re-hashes `file-history` backup blobs to the new path so `/rewind` still
-   resolves them.
-6. Remaps **nested subprojects** too (`--no-subprojects` to skip).
-7. Rewrites absolute paths inside the project's own `.claude/` settings and
-   hooks (`--no-project-settings` to skip).
-8. Verifies afterwards and reports anything still pointing at the old path.
+**Quit any Claude Code session running in the project first.** A live session
+holds `~/.claude.json` in memory and writes it back when it exits, which would
+undo half the migration. The script checks for this and refuses rather than
+letting it happen.
+
+## What moves
+
+| State | Where it lives |
+| --- | --- |
+| Session transcripts | `~/.claude/projects/<encoded-path>/*.jsonl` |
+| Memory files | `~/.claude/projects/<encoded-path>/memory/` |
+| Permissions, MCP servers, trust | `~/.claude.json` → `projects["<abs path>"]` |
+| Prompt history | `~/.claude/history.jsonl` |
+| File backups behind `/rewind` | `~/.claude/file-history/<session-id>/` |
+| Background job and session state | `~/.claude/jobs/`, `sessions/`, `session-env/` |
+
+`<encoded-path>` is the absolute path with every non-alphanumeric character
+replaced by `-`, so `/Users/me/dev/my_app` becomes `-Users-me-dev-my-app`.
+
+Beyond relocating those directories, the script rewrites references to the old
+path wherever they are embedded: the `cwd` recorded in each transcript, commands
+and output quoting the old path, memory file contents, `~/` shorthand forms, and
+absolute paths inside the project's own `.claude/` settings and hooks. Backup
+blobs behind `/rewind` are named from a hash of the file's path, so those get
+renamed too and stay resolvable.
+
+Files to update are found by scanning `~/.claude` for the old path, so state
+that a future Claude Code version introduces is covered automatically. Projects
+nested inside the folder you are moving are remapped as well.
+
+## Options
+
+| Flag | Effect |
+| --- | --- |
+| `-n`, `--dry-run` | Print the full plan and exit without changing anything |
+| `-y`, `--yes` | Skip the confirmation prompt |
+| `--state-only` | The folder is already at the new path; just fix Claude's state |
+| `--merge` | Combine with state that already exists at the new path |
+| `--no-subprojects` | Don't remap projects nested inside the folder |
+| `--no-project-settings` | Don't rewrite paths in the project's own `.claude/` files |
+| `--no-backup` | Skip the safety copy |
+| `--force` | Proceed despite non-fatal blockers, such as a live session |
+| `--list` | List known projects and exit |
 
 ## Safety
 
-- **Backup first.** Everything it is about to change is copied to
-  `~/.claude/claude-move-backups/<timestamp>/` (`--no-backup` to skip).
-- **Live sessions block the move.** A running Claude Code session holds
-  `~/.claude.json` in memory and writes it back on exit, undoing the config
-  half of the migration. Quit it first, or override with `--force`.
-- **`--force` cannot override the impossible.** Blockers that make execution
-  fail outright — a missing source, a non-empty destination — are fatal and
-  refuse regardless, rather than crashing halfway through.
-- **Atomic writes.** `~/.claude.json` and friends are written to a temp file
-  and renamed, so a crash never leaves a truncated config.
-- **Destination collisions are refused,** not silently merged. If you've already
-  run Claude at the new path, re-run with `--merge`: transcripts combine,
-  `allowedTools` union, `memory/MEMORY.md` index lines merge, and any other
-  conflicting file is kept beside the original as `name.migrated.ext` and
-  reported.
+- **Everything it will change is copied first** to
+  `~/.claude/claude-move-backups/<timestamp>/`. To undo a migration, restore
+  from there.
+- **`--dry-run` shows the exact file list** before anything happens.
+- **Writes are atomic** — temp file plus rename — so an interruption never
+  leaves a truncated `~/.claude.json`.
+- **It refuses rather than guesses.** A live session in the project, a
+  non-empty destination, or existing state at the new path all stop the run
+  with an explanation. `--force` covers the recoverable ones; it will not push
+  past a state that would fail partway through.
+- **Your files are never rewritten.** Only Claude's own state is edited. The
+  backups behind `/rewind` are verbatim copies of your source files, so those
+  get renamed but their contents are left alone.
 
-### The encoding is lossy
+If you have already run Claude at the new path, `--merge` combines the two:
+transcripts join, `allowedTools` union, `memory/MEMORY.md` index entries merge,
+and any other conflicting file is kept alongside the original as
+`name.migrated.ext` and reported so you can reconcile it.
 
-`my_app`, `my app` and `my-app` all encode to `-my-app` and therefore *share one
-state directory*. If the project being moved collides with another, the script
-warns before doing anything — the other project's transcripts will move too.
+### One caveat: the encoding is lossy
+
+`my_app`, `my app` and `my-app` all encode to `-my-app`, so those projects
+*share a single state directory*. If the project you are moving collides with
+another this way, the script warns you before doing anything — the other
+project's transcripts would move too.
 
 ## Tests
 
 ```bash
-python3 tests/test_claude_move.py            # temp dir, cleaned up
+python3 tests/test_claude_move.py            # runs in a temp dir, cleaned up
 python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
 ```
 
-45 assertions over a synthetic `~/.claude` built to mirror the real layout:
-the full migration, subprojects, `--merge`, `--dry-run` being read-only, the
-live-session and fatal blockers, already-moved detection, `--list`, and a
-JSON-escaped non-ASCII path. Your real `~/.claude` is never touched — the tool
-is always invoked with `--claude-dir`/`--config` pointed at the fixture.
-
-## After the move
-
-```bash
-cd /new/path && claude --continue
-```
-
-Memory, permissions and past sessions are all there. To undo, restore from the
-printed backup directory.
+The suite builds a synthetic `~/.claude` mirroring the real layout and checks
+the full migration, subprojects, merging, blockers, and `--dry-run` being
+read-only. Your real `~/.claude` is never touched.
