@@ -104,6 +104,19 @@ and any other conflicting file is kept alongside the original as
 another this way, the script warns you before doing anything — the other
 project's transcripts would move too.
 
+## Compatibility
+
+This tool works against Claude Code's on-disk layout, which is internal and not
+a documented API — a future version could rearrange it.
+
+Developed and tested against **Claude Code 2.1.226** on macOS, with Python
+3.11. The layout is the same on Linux, though it hasn't been exercised there.
+
+If a future version moves things around, the failure is visible rather than
+silent: `--dry-run` prints exactly which files it found and what it will do, so
+a plan that looks too small is the signal to check before running it. Nothing is
+edited until you confirm, and everything it touches is backed up first.
+
 ## Tests
 
 ```bash
@@ -118,3 +131,8 @@ read-only. Your real `~/.claude` is never touched.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+An independent project, not affiliated with, endorsed by, or supported by
+Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic.
