@@ -13,6 +13,7 @@ no session history:
 | Permissions, MCP servers, trust | `~/.claude.json` → `projects["<abs path>"]` | path |
 | Prompt history | `~/.claude/history.jsonl` | path |
 | File backups (rewind) | `~/.claude/file-history/<session-id>/` | `sha256(path)[:16]` |
+| Background job state | `~/.claude/jobs/<id>/state.json` | path |
 | Per-session env | `~/.claude/session-env/<session-id>/` | session id |
 
 `<encoded-path>` is the absolute path with every non-alphanumeric character
@@ -44,6 +45,17 @@ full plan and touches nothing.
    quoting the old path, memory file bodies, `history.jsonl` project tags,
    `~/` shorthand forms, and the encoded directory name where it appears in
    scratchpad paths.
+
+   These files are found by **scanning** `~/.claude` for the old path rather
+   than by an allowlist of state files, so directories a future Claude Code
+   version adds are covered without a code change. (An allowlist had already
+   gone stale: it missed `jobs/<id>/state.json`, which stores a `cwd`.) Skipped
+   during the scan: `projects/` (moved explicitly), `file-history/` (blobs are
+   verbatim copies of *your* files — only their names encode a path), and this
+   tool's own backups. `--dry-run` lists every file it matched, so you can see
+   the exact set before anything happens — including Claude's own
+   `backups/.claude.json.backup.*`, which are rewritten so that rolling one
+   back doesn't resurrect dead paths.
 5. Re-hashes `file-history` backup blobs to the new path so `/rewind` still
    resolves them.
 6. Remaps **nested subprojects** too (`--no-subprojects` to skip).
@@ -58,6 +70,9 @@ full plan and touches nothing.
 - **Live sessions block the move.** A running Claude Code session holds
   `~/.claude.json` in memory and writes it back on exit, undoing the config
   half of the migration. Quit it first, or override with `--force`.
+- **`--force` cannot override the impossible.** Blockers that make execution
+  fail outright — a missing source, a non-empty destination — are fatal and
+  refuse regardless, rather than crashing halfway through.
 - **Atomic writes.** `~/.claude.json` and friends are written to a temp file
   and renamed, so a crash never leaves a truncated config.
 - **Destination collisions are refused,** not silently merged. If you've already

@@ -10,14 +10,16 @@ Claude Code keys almost everything off the project's absolute path:
   ~/.claude.json  -> projects["<abs path>"]   permissions, MCP servers, trust
   ~/.claude/history.jsonl                 prompt history, tagged by project
   ~/.claude/file-history/<session-id>/     file backups, named sha256(path)[:16]
-  ~/.claude/session-env/<session-id>/      per-session env
-  ~/.claude/sessions/<pid>.json            live session records (cwd)
+  ~/.claude/session-env/, jobs/, sessions/ assorted per-session state
 
 where <encoded-path> is the absolute path with every non-alphanumeric
 character replaced by "-".  Moving a project with `mv` alone orphans all of
 it: Claude starts the new location with empty memory and no permissions.
 
-This script performs the move and rewrites every reference.
+This script performs the move and rewrites every reference.  Rather than
+enumerating the state files it knows about (a list that goes stale every time
+Claude Code grows a new directory), it scans ~/.claude for files that mention
+the old path and rewrites those.
 
 Usage:
     claude-move.py /old/path /new/path            # move files + state
@@ -39,13 +41,26 @@ import re
 import shutil
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+
+# Directories under ~/.claude that the path sweep must not touch:
+#   projects/            the moved state dirs are handled explicitly; other
+#                        projects' transcripts are none of our business
+#   file-history/        blobs are verbatim copies of the user's own files --
+#                        only their *names* encode a path
+#   claude-move-backups/ our own safety copies
+SKIP_TOP_LEVEL = {"projects", "file-history", "claude-move-backups"}
+
+# transcripts can be hundreds of MB; only the first lines are needed to learn
+# which directory a session ran in
+CWD_SCAN_LINES = 400
 
 # ---------------------------------------------------------------------------
 # path encoding
 # ---------------------------------------------------------------------------
 
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]")
+_CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 def encode_path(path: str) -> str:
@@ -54,9 +69,20 @@ def encode_path(path: str) -> str:
     /Users/me/Documents/my_app  ->  -Users-me-Documents-my-app
 
     Note this is lossy: "my_app", "my app" and "my-app" all collapse to the
-    same directory name.  collision checks below account for that.
+    same directory name.  The collision checks below account for that.
     """
     return _NON_ALNUM.sub("-", path)
+
+
+def backup_file_name(abs_path: str, previous_name: str) -> str:
+    """Name of a file-history blob for `abs_path`, keeping the @v<n> suffix.
+
+    Claude Code stores backups as sha256(absolute path)[:16]@v<version>, so a
+    moved file needs its blob renamed to stay resolvable.
+    """
+    digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:16]
+    _, sep, suffix = previous_name.partition("@")
+    return digest + sep + suffix
 
 
 def norm(path: str) -> str:
@@ -91,7 +117,6 @@ def tilde(path: str, home: str) -> Optional[str]:
 class Log:
     def __init__(self, quiet: bool = False) -> None:
         self.quiet = quiet
-        self.warnings: List[str] = []
 
     def info(self, msg: str = "") -> None:
         if not self.quiet:
@@ -101,54 +126,65 @@ class Log:
         if not self.quiet:
             print(f"  {msg}")
 
-    def warn(self, msg: str) -> None:
-        self.warnings.append(msg)
+    def _stderr(self, msg: str) -> None:
         sys.stdout.flush()
-        print(f"  warning: {msg}", file=sys.stderr)
+        print(msg, file=sys.stderr)
         sys.stderr.flush()
+
+    def warn(self, msg: str) -> None:
+        self._stderr(f"  warning: {msg}")
 
     def error(self, msg: str) -> None:
-        sys.stdout.flush()
-        print(f"error: {msg}", file=sys.stderr)
-        sys.stderr.flush()
+        self._stderr(f"error: {msg}")
 
 
-def read_json(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+def read_text(path: str) -> Optional[str]:
+    """Whole file as text, or None if it is binary or unreadable.  One open
+    per file -- the binary sniff and the read share it."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", "replace")
 
 
-def write_json_atomic(path: str, data: Any) -> None:
-    """Write JSON via a temp file + rename, so a crash or a concurrent reader
-    never sees a half-written ~/.claude.json."""
-    tmp = f"{path}.claude-move.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-        fh.write("\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+def tmp_path(path: str) -> str:
+    return f"{path}.claude-move.{os.getpid()}.tmp"
+
+
+def commit(tmp: str, path: str) -> None:
     if os.path.exists(path):
         shutil.copystat(path, tmp)
     os.replace(tmp, path)
+
+
+def discard(tmp: str) -> None:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
 
 
 def write_text_atomic(path: str, text: str) -> None:
-    tmp = f"{path}.claude-move.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    if os.path.exists(path):
-        shutil.copystat(path, tmp)
-    os.replace(tmp, path)
-
-
-def looks_binary(path: str) -> bool:
+    """Write via a temp file + rename, so a crash or a concurrent reader never
+    sees a half-written file."""
+    tmp = tmp_path(path)
     try:
-        with open(path, "rb") as fh:
-            return b"\0" in fh.read(8192)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        commit(tmp, path)
     except OSError:
-        return True
+        discard(tmp)
+        raise
+
+
+def write_json_atomic(path: str, data: Any) -> None:
+    write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def pid_alive(pid: int) -> bool:
@@ -157,6 +193,15 @@ def pid_alive(pid: int) -> bool:
     except OSError as exc:
         return exc.errno == errno.EPERM
     return True
+
+
+def unique(path: str) -> str:
+    """A path that does not exist yet, by suffixing .1, .2, ..."""
+    candidate, n = path, 1
+    while os.path.exists(candidate):
+        candidate = f"{path}.{n}"
+        n += 1
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -178,13 +223,16 @@ class Rewriter:
         self.hits = 0
 
     def add(self, old: str, new: str) -> None:
+        self._add(old, new)
+        # a path containing characters JSON escapes (non-ASCII, quotes,
+        # backslashes) appears in transcripts in escaped form; match that
+        # spelling too, so the raw-line fast path in _rewrite_jsonl stays sound
+        self._add(json.dumps(old)[1:-1], json.dumps(new)[1:-1])
+
+    def _add(self, old: str, new: str) -> None:
         if old and new and old != new and (old, new) not in self._pairs:
             self._pairs.append((old, new))
             self._pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
-
-    @property
-    def pairs(self) -> List[Tuple[str, str]]:
-        return list(self._pairs)
 
     def text(self, value: str) -> str:
         out = value
@@ -201,11 +249,25 @@ class Rewriter:
         if isinstance(value, list):
             return [self.obj(item) for item in value]
         if isinstance(value, dict):
-            return {self.text(k) if isinstance(k, str) else k: self.obj(v) for k, v in value.items()}
+            return {self.text(k) if isinstance(k, str) else k: self.obj(v)
+                    for k, v in value.items()}
         return value
 
     def touches(self, blob: str) -> bool:
         return any(old in blob for old, _ in self._pairs)
+
+
+def tracked_backups(rec: Any) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Yield (tracked file path, backup metadata) pairs from a transcript
+    record, skipping anything that isn't shaped like a backup entry."""
+    if not isinstance(rec, dict):
+        return
+    tracked = (rec.get("snapshot") or {}).get("trackedFileBackups")
+    if not isinstance(tracked, dict):
+        return
+    for path, meta in tracked.items():
+        if isinstance(meta, dict) and isinstance(meta.get("backupFileName"), str):
+            yield path, meta
 
 
 # ---------------------------------------------------------------------------
@@ -220,80 +282,19 @@ class Layout:
         self.dir = norm(claude_dir)
         self.config = norm(config_path)
         self.projects = os.path.join(self.dir, "projects")
-        self.history = os.path.join(self.dir, "history.jsonl")
         self.sessions = os.path.join(self.dir, "sessions")
         self.file_history = os.path.join(self.dir, "file-history")
-        self.session_env = os.path.join(self.dir, "session-env")
-        self.todos = os.path.join(self.dir, "todos")
 
     def state_dir(self, project_path: str) -> str:
         return os.path.join(self.projects, encode_path(project_path))
 
 
-def known_projects(layout: Layout) -> Dict[str, Dict[str, Any]]:
-    """Every project path Claude knows about, from ~/.claude.json plus the cwd
-    recorded inside transcripts (which catches projects the config forgot)."""
-    found: Dict[str, Dict[str, Any]] = {}
-
-    def note(path: str, source: str) -> None:
-        entry = found.setdefault(path, {"sources": set(), "sessions": 0, "memory": 0})
-        entry["sources"].add(source)
-
-    if os.path.exists(layout.config):
-        try:
-            cfg = read_json(layout.config)
-            for path in (cfg.get("projects") or {}):
-                note(norm(path), "config")
-        except (ValueError, OSError):
-            pass
-
-    if os.path.isdir(layout.projects):
-        for encoded in sorted(os.listdir(layout.projects)):
-            state = os.path.join(layout.projects, encoded)
-            if not os.path.isdir(state):
-                continue
-            for cwd in cwds_in_state_dir(state):
-                # a session can be run with its cwd inside ~/.claude (e.g. a
-                # subagent editing memory); that is not a project
-                if is_under(cwd, layout.dir):
-                    continue
-                note(cwd, "transcript")
-
-    for path, entry in found.items():
-        state = layout.state_dir(path)
-        if os.path.isdir(state):
-            entry["sessions"] = len([f for f in os.listdir(state) if f.endswith(".jsonl")])
-            memory = os.path.join(state, "memory")
-            if os.path.isdir(memory):
-                entry["memory"] = len(os.listdir(memory))
-    return found
-
-
-def cwds_in_state_dir(state_dir: str, limit_lines: int = 400) -> Set[str]:
-    """Pull the cwd values recorded in a state directory's transcripts."""
-    out: Set[str] = set()
-    try:
-        names = [f for f in os.listdir(state_dir) if f.endswith(".jsonl")]
-    except OSError:
-        return out
-    for name in names:
-        try:
-            with open(os.path.join(state_dir, name), "r", encoding="utf-8", errors="replace") as fh:
-                for i, line in enumerate(fh):
-                    if i >= limit_lines:
-                        break
-                    if '"cwd"' not in line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    cwd = rec.get("cwd")
-                    if isinstance(cwd, str) and cwd.startswith("/"):
-                        out.add(norm(cwd))
-        except OSError:
-            continue
-    return out
+def state_dirs(layout: Layout) -> List[str]:
+    if not os.path.isdir(layout.projects):
+        return []
+    paths = (os.path.join(layout.projects, name)
+             for name in sorted(os.listdir(layout.projects)))
+    return [p for p in paths if os.path.isdir(p)]
 
 
 def session_ids(state_dir: str) -> List[str]:
@@ -302,22 +303,71 @@ def session_ids(state_dir: str) -> List[str]:
     return sorted(f[:-len(".jsonl")] for f in os.listdir(state_dir) if f.endswith(".jsonl"))
 
 
-def live_sessions(layout: Layout) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+def memory_files(state_dir: str) -> List[str]:
+    memory = os.path.join(state_dir, "memory")
+    return sorted(os.listdir(memory)) if os.path.isdir(memory) else []
+
+
+def known_projects(layout: Layout) -> Set[str]:
+    """Every project path Claude knows about, from ~/.claude.json plus the cwd
+    recorded inside transcripts (which catches projects the config forgot)."""
+    found: Set[str] = set()
+    try:
+        cfg = json.loads(read_text(layout.config) or "{}")
+        found.update(norm(p) for p in (cfg.get("projects") or {}))
+    except (ValueError, AttributeError):
+        pass
+
+    for state in state_dirs(layout):
+        for cwd in cwds_in_state_dir(state):
+            # a session can run with its cwd inside ~/.claude (e.g. a subagent
+            # editing memory); that is not a project
+            if not is_under(cwd, layout.dir):
+                found.add(cwd)
+    return found
+
+
+def cwds_in_state_dir(state_dir: str) -> Set[str]:
+    """Pull the cwd values recorded in a state directory's transcripts.
+
+    Matches the raw JSON text instead of parsing each record -- these files are
+    large and a full parse of every line costs several times more for one field.
+    """
+    out: Set[str] = set()
+    for sid in session_ids(state_dir):
+        try:
+            with open(os.path.join(state_dir, sid + ".jsonl"), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i >= CWD_SCAN_LINES:
+                        break
+                    match = _CWD_RE.search(line)
+                    if not match:
+                        continue
+                    try:
+                        cwd = json.loads('"' + match.group(1) + '"')
+                    except ValueError:
+                        continue
+                    if cwd.startswith("/"):
+                        out.add(norm(cwd))
+        except OSError:
+            continue
+    return out
+
+
+def live_sessions(layout: Layout) -> Iterator[Dict[str, Any]]:
+    """Session records Claude Code writes per running process."""
     if not os.path.isdir(layout.sessions):
-        return out
+        return
     for name in sorted(os.listdir(layout.sessions)):
         if not name.endswith(".json"):
             continue
-        path = os.path.join(layout.sessions, name)
         try:
-            rec = read_json(path)
-        except (ValueError, OSError):
+            rec = json.loads(read_text(os.path.join(layout.sessions, name)) or "")
+        except (ValueError, AttributeError):
             continue
-        rec["_file"] = path
-        rec["_alive"] = isinstance(rec.get("pid"), int) and pid_alive(rec["pid"])
-        out.append(rec)
-    return out
+        if isinstance(rec, dict):
+            yield rec
 
 
 # ---------------------------------------------------------------------------
@@ -337,27 +387,28 @@ class Plan:
         self.home = norm(os.path.dirname(layout.config))
         self.mappings: List[Tuple[str, str]] = []      # (old project path, new)
         self.state_moves: List[Tuple[str, str]] = []   # (old state dir, new)
+        self.targets: List[str] = []                   # files naming the old path
         self.rewriter = Rewriter()
         self.move_files = not args.state_only
-        self.backup_dir: Optional[str] = None
-        self.blockers: List[str] = []
+        self.blockers: List[Tuple[str, bool]] = []     # (message, fatal)
 
     # -- build ------------------------------------------------------------
 
     def build(self) -> None:
-        self._resolve_mappings()
+        projects = known_projects(self.layout)   # scans every transcript; do it once
+        self._resolve_mappings(projects)
         self._build_rewriter()
         self._check_files()
+        self.targets = self._discover_targets()
         self._check_live_sessions()
-        self._check_collisions()
+        self._check_collisions(projects)
         self._check_state_dest()
 
-    def _resolve_mappings(self) -> None:
+    def _resolve_mappings(self, projects: Set[str]) -> None:
         self.mappings.append((self.src, self.dst))
         if self.args.subprojects:
-            for path in sorted(known_projects(self.layout)):
-                if path != self.src and is_under(path, self.src):
-                    self.mappings.append((path, remap(path, self.src, self.dst)))
+            nested = sorted(p for p in projects if p != self.src and is_under(p, self.src))
+            self.mappings.extend((p, remap(p, self.src, self.dst)) for p in nested)
         for old, new in self.mappings:
             old_state = self.layout.state_dir(old)
             new_state = self.layout.state_dir(new)
@@ -366,10 +417,7 @@ class Plan:
 
     def _build_rewriter(self) -> None:
         for old, new in self.mappings:
-            old_state = self.layout.state_dir(old)
-            new_state = self.layout.state_dir(new)
-            # most specific first (the sort in Rewriter.add handles ordering)
-            self.rewriter.add(old_state, new_state)
+            self.rewriter.add(self.layout.state_dir(old), self.layout.state_dir(new))
             self.rewriter.add(old, new)
             old_tilde, new_tilde = tilde(old, self.home), tilde(new, self.home)
             if old_tilde and new_tilde:
@@ -377,7 +425,51 @@ class Plan:
             # the bare encoded token, e.g. inside scratchpad paths under /tmp
             self.rewriter.add(encode_path(old), encode_path(new))
 
+    # -- target discovery -------------------------------------------------
+
+    def _discover_targets(self) -> List[str]:
+        """Every text file outside the moved state dirs that names the old
+        path.  Found by scanning rather than by an allowlist of state files
+        we happen to know about, so directories Claude Code adds in future
+        versions are covered without a code change.  The old absolute path is
+        a long, highly specific needle -- a file under ~/.claude containing it
+        is by construction a reference to this project."""
+        return [path for path in self._candidates()
+                if self.rewriter.touches(read_text(path) or "")]
+
+    def _candidates(self) -> Iterator[str]:
+        seen: Set[str] = set()
+
+        def offer(path: str) -> Iterator[str]:
+            if path not in seen and os.path.isfile(path):
+                seen.add(path)
+                yield path
+
+        def walk(root: str) -> Iterator[str]:
+            for parent, _dirs, files in os.walk(root):
+                for name in sorted(files):
+                    yield from offer(os.path.join(parent, name))
+
+        yield from offer(self.layout.config)
+        for entry in sorted(os.listdir(self.layout.dir)):
+            if entry in SKIP_TOP_LEVEL:
+                continue
+            path = os.path.join(self.layout.dir, entry)
+            yield from (walk(path) if os.path.isdir(path) else offer(path))
+
+        # the project's own .claude/ travels with the folder, but its settings
+        # and hooks can hold absolute paths
+        if self.args.project_settings:
+            settings = os.path.join(self.src if self.move_files else self.dst, ".claude")
+            if os.path.isdir(settings):
+                yield from walk(settings)
+
     # -- safety checks ----------------------------------------------------
+
+    def block(self, msg: str, fatal: bool = False) -> None:
+        """A fatal blocker makes execution impossible, so --force must not
+        skip it -- forcing past a missing source only crashes later."""
+        self.blockers.append((msg, fatal))
 
     def _check_files(self) -> None:
         src_exists = os.path.isdir(self.src)
@@ -390,46 +482,45 @@ class Plan:
 
         if self.move_files:
             if not src_exists:
-                self.blockers.append(f"source directory does not exist: {self.src}")
+                self.block(f"source directory does not exist: {self.src}", fatal=True)
             if dst_exists and os.listdir(self.dst):
-                self.blockers.append(
+                self.block(
                     f"destination already exists and is not empty: {self.dst}\n"
-                    f"           move the folder yourself, then re-run with --state-only")
+                    f"           move the folder yourself, then re-run with --state-only",
+                    fatal=True)
             if src_exists and is_under(self.dst, self.src):
-                self.blockers.append("destination is inside the source directory")
+                self.block("destination is inside the source directory", fatal=True)
         elif not dst_exists:
             self.log.warn(f"destination folder does not exist yet: {self.dst}")
 
     def _check_live_sessions(self) -> None:
         touched = {old for old, _ in self.mappings}
         for rec in live_sessions(self.layout):
-            cwd = rec.get("cwd")
-            if not isinstance(cwd, str):
+            cwd, pid = rec.get("cwd"), rec.get("pid")
+            if not isinstance(cwd, str) or not isinstance(pid, int):
                 continue
-            if not any(is_under(norm(cwd), path) for path in touched):
+            if not any(is_under(norm(cwd), path) for path in touched) or not pid_alive(pid):
                 continue
-            if rec.get("_alive"):
-                name = rec.get("name") or rec.get("sessionId", "?")
-                self.blockers.append(
-                    f"a Claude Code session is live in this project (pid {rec.get('pid')}, {name}).\n"
-                    f"           quit it first -- it holds ~/.claude.json in memory and will\n"
-                    f"           write the old paths back when it exits.  Override with --force.")
+            name = rec.get("name") or rec.get("sessionId", "?")
+            self.block(
+                f"a Claude Code session is live in this project (pid {pid}, {name}).\n"
+                f"           quit it first -- it holds ~/.claude.json in memory and will\n"
+                f"           write the old paths back when it exits.  Override with --force.")
 
-    def _check_collisions(self) -> None:
+    def _check_collisions(self, projects: Set[str]) -> None:
         """The encoded name is lossy, so two distinct project paths can share
         one state directory.  Moving it would drag the other project's
         transcripts along."""
         by_encoded: Dict[str, Set[str]] = {}
-        for path in known_projects(self.layout):
+        for path in projects:
             by_encoded.setdefault(encode_path(path), set()).add(path)
-        for old, _ in self.mappings:
-            others = by_encoded.get(encode_path(old), set()) - {old}
-            if others:
+        for old, new in self.mappings:
+            shared = by_encoded.get(encode_path(old), set()) - {old}
+            if shared:
                 self.log.warn(
-                    f"{old} shares its state directory with: {', '.join(sorted(others))}\n"
+                    f"{old} shares its state directory with: {', '.join(sorted(shared))}\n"
                     f"           (Claude collapses _, spaces and . to -).  Their transcripts "
                     f"will move too.")
-        for old, new in self.mappings:
             clashes = by_encoded.get(encode_path(new), set()) - {new, old}
             if clashes:
                 self.log.warn(f"the new path collides with existing project(s): "
@@ -438,12 +529,15 @@ class Plan:
     def _check_state_dest(self) -> None:
         for _, new_state in self.state_moves:
             if os.path.isdir(new_state) and os.listdir(new_state) and not self.args.merge:
-                self.blockers.append(
+                self.block(
                     f"state already exists for the new path: {new_state}\n"
                     f"           (you have run Claude there already).  Re-run with --merge "
                     f"to combine them.")
 
     # -- description ------------------------------------------------------
+
+    def shorten(self, path: str) -> str:
+        return tilde(path, self.home) or path
 
     def describe(self) -> None:
         log = self.log
@@ -454,22 +548,18 @@ class Plan:
 
         log.info()
         log.info("Files")
-        if self.move_files:
-            log.step(f"move {self.src}  ->  {self.dst}")
-        else:
-            log.step("(skipped -- folder already in place)")
+        log.step(f"move {self.src}  ->  {self.dst}" if self.move_files
+                 else "(skipped -- folder already in place)")
 
         log.info()
         log.info("Claude state")
         if not self.state_moves:
             log.step("no state directory found -- nothing recorded for this project yet")
         for old_state, new_state in self.state_moves:
-            sessions = len(session_ids(old_state))
-            memory_dir = os.path.join(old_state, "memory")
-            mem = len(os.listdir(memory_dir)) if os.path.isdir(memory_dir) else 0
             verb = "merge into" if os.path.isdir(new_state) and os.listdir(new_state) else "move to"
-            log.step(f"{os.path.basename(old_state)}")
-            log.step(f"    {sessions} transcript(s), {mem} memory file(s)")
+            log.step(os.path.basename(old_state))
+            log.step(f"    {len(session_ids(old_state))} transcript(s), "
+                     f"{len(memory_files(old_state))} memory file(s)")
             log.step(f"    {verb} {os.path.basename(new_state)}")
 
         if len(self.mappings) > 1:
@@ -479,27 +569,12 @@ class Plan:
                 log.step(f"{old}  ->  {new}")
 
         log.info()
-        log.info("References rewritten in")
-        for target in self._rewrite_targets(existing_only=True):
+        log.info(f"References rewritten in {len(self.targets)} file(s) outside the state dir")
+        for target in self.targets[:12]:
             log.step(self.shorten(target))
-        log.step("moved transcripts, memory files and per-session env")
-
-    def shorten(self, path: str) -> str:
-        return tilde(path, self.home) or path
-
-    # -- targets ----------------------------------------------------------
-
-    def _rewrite_targets(self, existing_only: bool = False) -> List[str]:
-        targets = [self.layout.config, self.layout.history]
-        if os.path.isdir(self.layout.sessions):
-            targets += [os.path.join(self.layout.sessions, f)
-                        for f in sorted(os.listdir(self.layout.sessions)) if f.endswith(".json")]
-        if os.path.isdir(self.layout.todos):
-            targets += [os.path.join(self.layout.todos, f)
-                        for f in sorted(os.listdir(self.layout.todos)) if f.endswith(".json")]
-        if existing_only:
-            targets = [t for t in targets if os.path.exists(t)]
-        return targets
+        if len(self.targets) > 12:
+            log.step(f"... and {len(self.targets) - 12} more")
+        log.step("plus the moved transcripts and memory files")
 
 
 # ---------------------------------------------------------------------------
@@ -517,27 +592,28 @@ class Mover:
         self.files_rewritten = 0
         self.backups_renamed = 0
         self.conflicts: List[str] = []
+        self.stale: List[str] = []
 
     # -- backup -----------------------------------------------------------
 
     def backup(self) -> Optional[str]:
         if self.args.no_backup:
             return None
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        root = os.path.join(self.layout.dir, "claude-move-backups", stamp)
-        os.makedirs(root, exist_ok=True)
-        for path in (self.layout.config, self.layout.history):
-            if os.path.exists(path):
-                shutil.copy2(path, os.path.join(root, os.path.basename(path)))
+        root = os.path.join(self.layout.dir, "claude-move-backups",
+                            time.strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(os.path.join(root, "files"), exist_ok=True)
+        for path in [self.layout.config] + self.plan.targets:
+            if os.path.isfile(path):
+                shutil.copy2(path, unique(os.path.join(root, "files", os.path.basename(path))))
         for old_state, _ in self.plan.state_moves:
-            dest = os.path.join(root, "projects", os.path.basename(old_state))
-            shutil.copytree(old_state, dest, dirs_exist_ok=True)
+            shutil.copytree(old_state,
+                            os.path.join(root, "projects", os.path.basename(old_state)),
+                            dirs_exist_ok=True)
             for sid in session_ids(old_state):
-                fh_dir = os.path.join(self.layout.file_history, sid)
-                if os.path.isdir(fh_dir):
-                    shutil.copytree(fh_dir, os.path.join(root, "file-history", sid),
+                blobs = os.path.join(self.layout.file_history, sid)
+                if os.path.isdir(blobs):
+                    shutil.copytree(blobs, os.path.join(root, "file-history", sid),
                                     dirs_exist_ok=True)
-        self.plan.backup_dir = root
         return root
 
     # -- moves ------------------------------------------------------------
@@ -555,17 +631,16 @@ class Mover:
 
     def move_state_dirs(self) -> None:
         for old_state, new_state in self.plan.state_moves:
+            name = f"{os.path.basename(old_state)} -> {os.path.basename(new_state)}"
             if os.path.isdir(new_state) and os.listdir(new_state):
                 self._merge_tree(old_state, new_state)
-                self.log.step(f"merged {os.path.basename(old_state)} -> "
-                              f"{os.path.basename(new_state)}")
+                self.log.step(f"merged {name}")
             else:
                 if os.path.isdir(new_state):
                     os.rmdir(new_state)
                 os.makedirs(os.path.dirname(new_state), exist_ok=True)
                 shutil.move(old_state, new_state)
-                self.log.step(f"moved {os.path.basename(old_state)} -> "
-                              f"{os.path.basename(new_state)}")
+                self.log.step(f"moved {name}")
 
     def _merge_tree(self, src: str, dst: str) -> None:
         """Copy src into dst.  Existing files win; the incoming version is kept
@@ -588,11 +663,10 @@ class Mover:
         shutil.rmtree(src, ignore_errors=True)
 
     def _merge_memory_index(self, source: str, target: str) -> None:
-        """Append the pointer lines the destination index is missing."""
-        try:
-            incoming = open(source, "r", encoding="utf-8", errors="replace").read()
-            existing = open(target, "r", encoding="utf-8", errors="replace").read()
-        except OSError:
+        """MEMORY.md is an index of one-line pointers -- union it rather than
+        stranding the incoming copy in a .migrated file."""
+        incoming, existing = read_text(source), read_text(target)
+        if incoming is None or existing is None:
             return
         have = {line.strip() for line in existing.splitlines() if line.strip()}
         added = [line for line in incoming.splitlines()
@@ -600,35 +674,142 @@ class Mover:
         if not added:
             return
         text = existing if existing.endswith("\n") else existing + "\n"
-        text += "\n".join(added) + "\n"
-        write_text_atomic(target, text)
+        write_text_atomic(target, text + "\n".join(added) + "\n")
         self.log.step(f"merged {len(added)} line(s) into memory/MEMORY.md")
 
     # -- rewriting --------------------------------------------------------
 
     def rewrite_everything(self) -> None:
-        for target in self.plan._rewrite_targets(existing_only=True):
-            if target == self.layout.config:
+        for target in self.plan.targets:
+            # targets inside the project moved along with it
+            path = (remap(target, self.plan.src, self.plan.dst)
+                    if is_under(target, self.plan.src) else target)
+            if not os.path.isfile(path):
+                continue
+            if path == self.layout.config:
                 self._rewrite_config()
-            elif target.endswith(".jsonl"):
-                self._rewrite_jsonl(target)
+            elif path.endswith(".jsonl"):
+                self._rewrite_jsonl(path)
+            elif path.endswith(".json"):
+                self._rewrite_json(path)
             else:
-                self._rewrite_json(target)
+                self._rewrite_text(path)
 
         for _old_state, new_state in self.plan.state_moves:
             self._rewrite_state_dir(new_state)
 
-        if self.args.project_settings:
-            self._rewrite_project_settings()
+    def _rewrite_state_dir(self, state_dir: str) -> None:
+        """Transcripts and memory files, then the file-history blobs whose
+        names encode a path that just changed."""
+        renames: Dict[str, str] = {}
+        for root, _dirs, files in os.walk(state_dir):
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                if name.endswith(".jsonl"):
+                    renames.update(self._rewrite_jsonl(path))
+                else:
+                    self._rewrite_text(path)
+
+        for sid in session_ids(state_dir):
+            blobs = os.path.join(self.layout.file_history, sid)
+            for old_name, new_name in renames.items():
+                source = os.path.join(blobs, old_name)
+                target = os.path.join(blobs, new_name)
+                if os.path.exists(source) and not os.path.exists(target):
+                    os.rename(source, target)
+                    self.backups_renamed += 1
+
+    def _rewrite_jsonl(self, path: str) -> Dict[str, str]:
+        """Stream a JSONL file, rewriting only the lines that name an old path.
+        Returns the file-history blob renames its records imply.
+
+        Streaming keeps peak memory at one line, and the per-line guard skips
+        parsing the majority of records -- transcripts and history.jsonl are
+        the largest files this tool touches.
+        """
+        renames: Dict[str, str] = {}
+        tmp = tmp_path(path)
+        changed = False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as source, \
+                    open(tmp, "w", encoding="utf-8") as out:
+                for line in source:
+                    if not self.rewriter.touches(line):
+                        out.write(line)
+                        continue
+                    changed = True
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        out.write(self._rewritten(path, line))
+                        continue
+                    for file_path, meta in tracked_backups(rec):
+                        new_path = self.rewriter.text(file_path)
+                        if new_path == file_path:
+                            continue
+                        # keep the blob name consistent with the new path, in
+                        # the same pass that rewrites the path itself
+                        old_name = meta["backupFileName"]
+                        renames[old_name] = meta["backupFileName"] = \
+                            backup_file_name(new_path, old_name)
+                    encoded = json.dumps(self.rewriter.obj(rec), ensure_ascii=False)
+                    out.write(self._note_stale(path, encoded) + "\n")
+        except OSError as exc:
+            discard(tmp)
+            self.log.warn(f"could not rewrite {path}: {exc}")
+            return {}
+
+        if changed:
+            commit(tmp, path)
+            self.files_rewritten += 1
+        else:
+            discard(tmp)
+        return renames
+
+    def _rewrite_json(self, path: str) -> None:
+        blob = read_text(path)
+        if blob is None or not self.rewriter.touches(blob):
+            return
+        try:
+            data = self.rewriter.obj(json.loads(blob))
+        except ValueError:
+            self._rewrite_text(path)
+            return
+        write_json_atomic(path, data)
+        self._note_stale(path, json.dumps(data, ensure_ascii=False))
+        self.files_rewritten += 1
+
+    def _rewrite_text(self, path: str) -> None:
+        text = read_text(path)
+        if text is None or not self.rewriter.touches(text):
+            return
+        write_text_atomic(path, self._rewritten(path, text))
+        self.files_rewritten += 1
+
+    def _rewritten(self, path: str, text: str) -> str:
+        return self._note_stale(path, self.rewriter.text(text))
+
+    def _note_stale(self, path: str, text: str) -> str:
+        """Record anything still naming the old path after rewriting, so
+        verification is a byproduct of the write pass rather than a third
+        walk over everything it just wrote."""
+        if path not in self.stale and self.rewriter.touches(text):
+            self.stale.append(path)
+        return text
 
     def _rewrite_config(self) -> None:
         """~/.claude.json: rename the projects key (merging if the new key
-        already exists) then sweep the rest of the file for stale paths."""
+        already exists -- a plain rewrite would silently drop one entry), then
+        let the generic sweep handle every other reference in the file."""
         path = self.layout.config
+        blob = read_text(path)
+        if blob is None:
+            self.log.warn(f"could not read {path}")
+            return
         try:
-            cfg = read_json(path)
-        except (ValueError, OSError) as exc:
-            self.log.warn(f"could not read {path}: {exc}")
+            cfg = json.loads(blob)
+        except ValueError as exc:
+            self.log.warn(f"could not parse {path}: {exc}")
             return
 
         projects = cfg.get("projects")
@@ -644,209 +825,23 @@ class Mover:
                     projects[new] = entry
                     self.log.step(f"config: {old} -> {new}")
 
-        before = json.dumps(cfg, ensure_ascii=False)
+        before = self.rewriter.hits
         cfg = self.rewriter.obj(cfg)
-        after = json.dumps(cfg, ensure_ascii=False)
-        if before != after:
+        if self.rewriter.hits != before:
             self.files_rewritten += 1
         write_json_atomic(path, cfg)
-
-    def _rewrite_json(self, path: str) -> None:
-        try:
-            blob = open(path, "r", encoding="utf-8").read()
-        except OSError:
-            return
-        if not self.rewriter.touches(blob):
-            return
-        try:
-            data = json.loads(blob)
-        except ValueError:
-            write_text_atomic(path, self.rewriter.text(blob))
-            self.files_rewritten += 1
-            return
-        write_json_atomic(path, self.rewriter.obj(data))
-        self.files_rewritten += 1
-
-    def _rewrite_jsonl(self, path: str) -> Dict[str, Dict[str, Any]]:
-        """Rewrite a JSONL file line by line.  Returns the file-history backup
-        entries seen, so their on-disk names can be fixed up afterwards."""
-        backups: Dict[str, Dict[str, Any]] = {}
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
-        except OSError as exc:
-            self.log.warn(f"could not read {path}: {exc}")
-            return backups
-
-        changed = False
-        out: List[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                out.append(line)
-                continue
-            try:
-                rec = json.loads(stripped)
-            except ValueError:
-                new_line = self.rewriter.text(line)
-                changed = changed or new_line != line
-                out.append(new_line)
-                continue
-
-            tracked = (rec.get("snapshot") or {}).get("trackedFileBackups")
-            if isinstance(tracked, dict):
-                for file_path, meta in tracked.items():
-                    if isinstance(meta, dict) and isinstance(meta.get("backupFileName"), str):
-                        new_path = self.rewriter.text(file_path)
-                        if new_path != file_path:
-                            backups[meta["backupFileName"]] = {
-                                "old_path": file_path, "new_path": new_path,
-                                "version": meta.get("version"),
-                            }
-
-            new_rec = self.rewriter.obj(rec)
-            new_line = json.dumps(new_rec, ensure_ascii=False) + "\n"
-            if json.dumps(rec, ensure_ascii=False) + "\n" != new_line:
-                changed = True
-            out.append(new_line)
-
-        if changed:
-            write_text_atomic(path, "".join(out))
-            self.files_rewritten += 1
-        return backups
-
-    def _rewrite_state_dir(self, state_dir: str) -> None:
-        """Transcripts, memory files, and each session's env directory."""
-        renames: Dict[str, Dict[str, Any]] = {}
-        for root, _dirs, files in os.walk(state_dir):
-            for name in files:
-                path = os.path.join(root, name)
-                if name.endswith(".jsonl"):
-                    renames.update(self._rewrite_jsonl(path))
-                elif not looks_binary(path):
-                    self._rewrite_text(path)
-
-        for sid in session_ids(state_dir):
-            env_dir = os.path.join(self.layout.session_env, sid)
-            if os.path.isdir(env_dir):
-                for root, _dirs, files in os.walk(env_dir):
-                    for name in files:
-                        path = os.path.join(root, name)
-                        if not looks_binary(path):
-                            self._rewrite_text(path)
-
-        self._rename_file_history(state_dir, renames)
-
-    def _rewrite_text(self, path: str) -> None:
-        try:
-            text = open(path, "r", encoding="utf-8", errors="replace").read()
-        except OSError:
-            return
-        if not self.rewriter.touches(text):
-            return
-        write_text_atomic(path, self.rewriter.text(text))
-        self.files_rewritten += 1
-
-    def _rename_file_history(self, state_dir: str, renames: Dict[str, Dict[str, Any]]) -> None:
-        """File backups are stored as sha256(abs path)[:16]@v<n>.  When the
-        tracked path changes, rename the blob so the hash still matches."""
-        if not renames:
-            return
-        for sid in session_ids(state_dir):
-            fh_dir = os.path.join(self.layout.file_history, sid)
-            if not os.path.isdir(fh_dir):
-                continue
-            for old_name, info in renames.items():
-                src = os.path.join(fh_dir, old_name)
-                if not os.path.exists(src):
-                    continue
-                suffix = old_name.split("@", 1)[1] if "@" in old_name else ""
-                digest = hashlib.sha256(info["new_path"].encode("utf-8")).hexdigest()[:16]
-                new_name = f"{digest}@{suffix}" if suffix else digest
-                dst = os.path.join(fh_dir, new_name)
-                if os.path.exists(dst):
-                    continue
-                os.rename(src, dst)
-                self.backups_renamed += 1
-
-        # the transcripts still name the old blobs -- fix them up
-        for root, _dirs, files in os.walk(state_dir):
-            for name in files:
-                if name.endswith(".jsonl"):
-                    self._fix_backup_names(os.path.join(root, name))
-
-    def _fix_backup_names(self, path: str) -> None:
-        try:
-            lines = open(path, "r", encoding="utf-8", errors="replace").readlines()
-        except OSError:
-            return
-        changed = False
-        out: List[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or '"trackedFileBackups"' not in stripped:
-                out.append(line)
-                continue
-            try:
-                rec = json.loads(stripped)
-            except ValueError:
-                out.append(line)
-                continue
-            tracked = (rec.get("snapshot") or {}).get("trackedFileBackups") or {}
-            for file_path, meta in tracked.items():
-                if not isinstance(meta, dict) or not isinstance(meta.get("backupFileName"), str):
-                    continue
-                old_name = meta["backupFileName"]
-                suffix = old_name.split("@", 1)[1] if "@" in old_name else ""
-                digest = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:16]
-                new_name = f"{digest}@{suffix}" if suffix else digest
-                if new_name != old_name:
-                    meta["backupFileName"] = new_name
-                    changed = True
-            out.append(json.dumps(rec, ensure_ascii=False) + "\n")
-        if changed:
-            write_text_atomic(path, "".join(out))
-
-    def _rewrite_project_settings(self) -> None:
-        """The project's own .claude/ travels with the folder, but its settings
-        can hold absolute paths (hooks, permissions)."""
-        settings_dir = os.path.join(self.plan.dst, ".claude")
-        if not os.path.isdir(settings_dir):
-            return
-        for root, _dirs, files in os.walk(settings_dir):
-            for name in files:
-                if name.endswith((".json", ".md", ".sh", ".toml", ".yaml", ".yml")):
-                    path = os.path.join(root, name)
-                    if not looks_binary(path):
-                        self._rewrite_text(path)
+        self._note_stale(path, json.dumps(cfg, ensure_ascii=False))
 
     # -- verify -----------------------------------------------------------
 
     def verify(self) -> List[str]:
-        """Report anything still pointing at the old location."""
-        stale: List[str] = []
-        needles = [old for old, _ in self.rewriter.pairs]
-
-        def scan(path: str) -> None:
-            try:
-                if looks_binary(path):
-                    return
-                blob = open(path, "r", encoding="utf-8", errors="replace").read()
-            except OSError:
-                return
-            if any(n in blob for n in needles):
-                stale.append(path)
-
-        for path in self.plan._rewrite_targets(existing_only=True):
-            scan(path)
-        for _old, new_state in self.plan.state_moves:
-            for root, _dirs, files in os.walk(new_state):
-                for name in files:
-                    scan(os.path.join(root, name))
-        for old, _new in self.plan.mappings:
-            if os.path.isdir(self.layout.state_dir(old)):
-                stale.append(self.layout.state_dir(old) + "  (old state dir still present)")
-        return stale
+        """Anything still pointing at the old location.  The rewrite pass
+        already recorded residual matches as it wrote; only the directory
+        checks are left."""
+        return self.stale + [
+            f"{self.layout.state_dir(old)}  (old state dir still present)"
+            for old, _ in self.plan.mappings
+            if os.path.isdir(self.layout.state_dir(old))]
 
 
 def merge_settings(incoming: Any, existing: Any) -> Any:
@@ -858,11 +853,7 @@ def merge_settings(incoming: Any, existing: Any) -> Any:
             out[key] = merge_settings(value, existing[key]) if key in existing else value
         return out
     if isinstance(incoming, list) and isinstance(existing, list):
-        out = list(existing)
-        for item in incoming:
-            if item not in out:
-                out.append(item)
-        return out
+        return existing + [item for item in incoming if item not in existing]
     return existing
 
 
@@ -872,16 +863,16 @@ def merge_settings(incoming: Any, existing: Any) -> Any:
 
 
 def cmd_list(layout: Layout, log: Log) -> int:
-    projects = known_projects(layout)
+    projects = sorted(known_projects(layout))
     if not projects:
         log.info("no Claude Code projects found")
         return 0
     width = max(len(p) for p in projects)
     log.info(f"{'project'.ljust(width)}  sessions  memory  encoded")
-    for path in sorted(projects):
-        info = projects[path]
-        log.info(f"{path.ljust(width)}  {info['sessions']:>8}  {info['memory']:>6}  "
-                 f"{encode_path(path)}")
+    for path in projects:
+        state = layout.state_dir(path)
+        log.info(f"{path.ljust(width)}  {len(session_ids(state)):>8}  "
+                 f"{len(memory_files(state)):>6}  {encode_path(path)}")
     return 0
 
 
@@ -933,14 +924,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     log = Log(quiet=args.quiet)
     layout = Layout(args.claude_dir, args.config)
 
     if args.list:
         return cmd_list(layout, log)
     if not args.src or not args.dst:
-        build_parser().print_usage(sys.stderr)
+        parser.print_usage(sys.stderr)
         log.error("both a source and a destination path are required (or use --list)")
         return 2
     if not os.path.isdir(layout.dir):
@@ -956,13 +948,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if plan.blockers:
         log.info()
-        sys.stdout.flush()
-        for blocker in plan.blockers:
-            print(f"blocked: {blocker}", file=sys.stderr)
-        sys.stderr.flush()
-        if not args.force:
+        for message, _fatal in plan.blockers:
+            log.error(f"blocked: {message}")
+        fatal = any(fatal for _, fatal in plan.blockers)
+        if fatal or not args.force:
             log.info()
-            log.error("nothing was changed.  fix the above, or pass --force.")
+            log.error("nothing was changed." + ("  this cannot be overridden." if fatal
+                                                else "  fix the above, or pass --force."))
             return 1
         log.warn("proceeding anyway (--force)")
 
