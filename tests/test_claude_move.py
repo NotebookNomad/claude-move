@@ -266,6 +266,62 @@ def test_escaped_non_ascii(root):
     ok(rec["cwd"] == new, "escaped non-ASCII path rewritten")
 
 
+def test_destination_is_a_directory(root):
+    """mv semantics: an existing directory is a container, so the project keeps
+    its own name inside it."""
+    print("== destination is an existing directory ==")
+    home, old, _, sid = fixture(root, "container")
+    container = os.path.join(home, "work")
+    os.makedirs(container, exist_ok=True)
+    result = run(home, old, container, "-y")
+    landed = os.path.join(container, "my_app")
+    ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:200]})")
+    ok(os.path.exists(os.path.join(landed, "main.py")), "moved into the directory by name")
+    ok(not os.path.exists(container + "/main.py"), "did not splat contents into the container")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    ok(landed in cfg["projects"], "config keyed by the landed path")
+    ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(landed))),
+       "state dir follows the landed path")
+
+    print("== an empty destination directory is still a container ==")
+    home, old, _, _ = fixture(root, "container-empty")
+    dest = os.path.join(home, "work", "api")
+    os.makedirs(dest, exist_ok=True)
+    run(home, old, dest, "-y")
+    ok(os.path.exists(os.path.join(dest, "my_app", "main.py")),
+       "empty directory behaves like mv, not like a rename target")
+
+    print("== already-moved detection is not treated as a container ==")
+    home, old, _, _ = fixture(root, "container-moved")
+    new = os.path.join(home, "work", "api")
+    os.makedirs(os.path.join(home, "work"), exist_ok=True)
+    shutil.move(old, new)
+    run(home, old, new, "-y")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    ok(new in cfg["projects"], "already-moved folder keeps the given path")
+    ok(not os.path.exists(os.path.join(new, "my_app")), "was not nested one level deeper")
+
+    print("== --state-only is not treated as a container ==")
+    home, old, _, _ = fixture(root, "container-stateonly")
+    new = os.path.join(home, "work", "api")
+    os.makedirs(new, exist_ok=True)
+    run(home, old, new, "-y", "--state-only")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    ok(new in cfg["projects"] and f"{new}/my_app" not in cfg["projects"],
+       "--state-only keeps the given path")
+
+    print("== degenerate destinations ==")
+    home, old, _, _ = fixture(root, "container-degenerate")
+    result = run(home, old, os.path.dirname(old), "-y")   # ~/dev/my_app -> ~/dev
+    ok(result.returncode != 0 and os.path.isdir(old),
+       "moving into its own parent resolves to itself and is refused")
+    target = os.path.join(home, "afile")
+    open(target, "w").write("not a directory\n")
+    result = run(home, old, target, "-y")
+    ok(result.returncode != 0 and os.path.isfile(target),
+       "destination that is a file is refused")
+
+
 def test_list(root):
     print("== --list ==")
     home, old, _, _ = fixture(root, "list")
@@ -279,7 +335,8 @@ def main():
     root = sys.argv[1] if keep else tempfile.mkdtemp(prefix="claude-move-tests-")
     try:
         for test in (test_core_migration, test_dry_run, test_merge, test_blockers,
-                     test_already_moved, test_escaped_non_ascii, test_list):
+                     test_already_moved, test_destination_is_a_directory,
+                     test_escaped_non_ascii, test_list):
             test(root)
     finally:
         if not keep:

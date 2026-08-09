@@ -30,6 +30,14 @@ cd ~/work/api-server && claude --continue
 Renaming is the same operation — `~/dev/api` → `~/dev/backend` works exactly
 like a move.
 
+The destination follows `mv`: if it names an **existing directory**, the project
+moves *into* it and keeps its own name.
+
+```bash
+./claude-move.py ~/dev/api ~/work            # ~/work exists  → ~/work/api
+./claude-move.py ~/dev/api ~/work/api-2      # doesn't exist  → renamed to api-2
+```
+
 Single file, Python 3.8+, standard library only. Nothing to install.
 
 **Quit any Claude Code session running in the project first.** A live session

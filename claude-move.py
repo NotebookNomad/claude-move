@@ -22,6 +22,7 @@ Claude Code versions newer than this script is covered too.
 
 Usage:
     claude-move.py /old/path /new/path            # move files + state
+    claude-move.py /old/path /existing/dir        # moves in, keeping its name
     claude-move.py /old/path /new/path --dry-run  # show the plan only
     claude-move.py /old/path /new/path --state-only   # folder already moved
     claude-move.py --list                         # show known projects
@@ -394,6 +395,7 @@ class Plan:
     # -- build ------------------------------------------------------------
 
     def build(self) -> None:
+        self._resolve_destination()
         projects = known_projects(self.layout)   # scans every transcript; do it once
         self._resolve_mappings(projects)
         self._build_rewriter()
@@ -402,6 +404,24 @@ class Plan:
         self._check_live_sessions()
         self._check_collisions(projects)
         self._check_state_dest()
+
+    def _resolve_destination(self) -> None:
+        """`mv` semantics: an existing directory is a container, so
+        `claude-move ~/dev/api ~/work` lands the project at ~/work/api.
+
+        Not applied when the folder is already at the destination (--state-only,
+        or auto-detected because the source is gone).  There the destination
+        names the project itself, and treating it as a container would nest it
+        one level deeper than the user meant.
+        """
+        if self.args.state_only or not os.path.isdir(self.src):
+            return
+        if not os.path.isdir(self.dst):
+            return
+        container = self.dst
+        self.dst = os.path.join(container, os.path.basename(self.src))
+        self.log.info(f"note: {container} is an existing directory -- "
+                      f"moving into it as {os.path.basename(self.dst)}")
 
     def _resolve_mappings(self, projects: Set[str]) -> None:
         self.mappings.append((self.src, self.dst))
@@ -482,12 +502,20 @@ class Plan:
         if self.move_files:
             if not src_exists:
                 self.block(f"source directory does not exist: {self.src}", fatal=True)
+            if os.path.exists(self.dst) and not dst_exists:
+                self.block(f"destination exists and is not a directory: {self.dst}", fatal=True)
+            if src_exists and self.src == self.dst:
+                # e.g. moving a project into its own parent directory; the
+                # remaining destination checks would only restate this
+                self.block(f"source and destination resolve to the same path: {self.src}",
+                           fatal=True)
+                return
             if dst_exists and os.listdir(self.dst):
                 self.block(
                     f"destination already exists and is not empty: {self.dst}\n"
                     f"           move the folder yourself, then re-run with --state-only",
                     fatal=True)
-            if src_exists and is_under(self.dst, self.src):
+            if src_exists and self.dst != self.src and is_under(self.dst, self.src):
                 self.block("destination is inside the source directory", fatal=True)
         elif not dst_exists:
             self.log.warn(f"destination folder does not exist yet: {self.dst}")
@@ -891,6 +919,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   claude-move.py ~/dev/api ~/work/api-server     move and rename
+  claude-move.py ~/dev/api ~/work                ~/work exists -> ~/work/api
   claude-move.py ~/dev/api ~/work/api --dry-run  show the plan, change nothing
   claude-move.py ~/dev/api ~/work/api --state-only
                                                  folder already moved by hand
