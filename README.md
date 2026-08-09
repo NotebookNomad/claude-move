@@ -38,6 +38,10 @@ moves *into* it and keeps its own name.
 ./claude-move.py ~/dev/api ~/work/api-2      # doesn't exist  → renamed to api-2
 ```
 
+If you already moved the folder yourself, pass the same two paths you gave `mv`
+and the state catches up — `mv ~/dev/api ~/work` then
+`claude-move.py ~/dev/api ~/work` finds the project at `~/work/api`.
+
 Single file, Python 3.8+, standard library only. Nothing to install.
 
 **Quit any Claude Code session running in the project first.** A live session

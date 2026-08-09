@@ -310,6 +310,21 @@ def test_destination_is_a_directory(root):
     ok(new in cfg["projects"] and f"{new}/my_app" not in cfg["projects"],
        "--state-only keeps the given path")
 
+    print("== moved by hand into a container, then run with the same arguments ==")
+    for extra in ([], ["--state-only"]):
+        home, old, _, _ = fixture(root, "container-byhand" + "".join(extra))
+        container = os.path.join(home, "work")
+        os.makedirs(container, exist_ok=True)
+        shutil.move(old, container)                 # exactly what `mv` does
+        landed = os.path.join(container, "my_app")
+        run(home, old, container, "-y", *extra)
+        cfg = json.load(open(os.path.join(home, ".claude.json")))
+        label = " ".join(extra) or "(no flag)"
+        ok(landed in cfg["projects"], f"{label}: config points at the landed folder")
+        ok(container not in cfg["projects"], f"{label}: container did not become a project")
+        ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(landed))),
+           f"{label}: state dir follows the landed folder")
+
     print("== degenerate destinations ==")
     home, old, _, _ = fixture(root, "container-degenerate")
     result = run(home, old, os.path.dirname(old), "-y")   # ~/dev/my_app -> ~/dev
@@ -320,6 +335,16 @@ def test_destination_is_a_directory(root):
     result = run(home, old, target, "-y")
     ok(result.returncode != 0 and os.path.isfile(target),
        "destination that is a file is refused")
+
+    home, old, _, _ = fixture(root, "container-dangling")
+    container = os.path.join(home, "work")
+    os.makedirs(container, exist_ok=True)
+    os.symlink(os.path.join(home, "gone"), os.path.join(container, "my_app"))
+    result = run(home, old, container, "-y")
+    ok(result.returncode != 0 and "Traceback" not in result.stderr,
+       "dangling symlink at the destination is refused, not crashed into")
+    ok(not os.path.isdir(os.path.join(home, ".claude", "claude-move-backups")),
+       "refused before taking a backup")
 
 
 def test_list(root):

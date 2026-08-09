@@ -414,14 +414,32 @@ class Plan:
         names the project itself, and treating it as a container would nest it
         one level deeper than the user meant.
         """
-        if self.args.state_only or not os.path.isdir(self.src):
+        landed = os.path.join(self.dst, os.path.basename(self.src))
+
+        if not os.path.isdir(self.src):
+            # The folder is already gone, so it was moved by hand -- and `mv`
+            # into an existing directory leaves it at <dst>/<name>, not at
+            # <dst>.  Prefer that when it is there, or the state would be
+            # rewritten to point at the container.
+            if os.path.isdir(landed):
+                self.log.warn(
+                    f"{self.src} is gone and {landed} exists -- assuming the folder was "
+                    f"moved *into* {self.dst}.\n"
+                    f"           pass the full path if {self.dst} is itself the project.")
+                self.dst = landed
             return
-        if not os.path.isdir(self.dst):
+
+        if self.args.state_only or not os.path.isdir(self.dst):
             return
-        container = self.dst
-        self.dst = os.path.join(container, os.path.basename(self.src))
-        self.log.info(f"note: {container} is an existing directory -- "
-                      f"moving into it as {os.path.basename(self.dst)}")
+
+        container, self.dst = self.dst, landed
+        note = (f"{container} is an existing directory -- "
+                f"moving into it as {os.path.basename(self.dst)}")
+        if os.listdir(container):
+            self.log.info(f"note: {note}")
+        else:
+            # an empty directory looks like a rename target, so say it louder
+            self.log.warn(note)
 
     def _resolve_mappings(self, projects: Set[str]) -> None:
         self.mappings.append((self.src, self.dst))
@@ -502,7 +520,9 @@ class Plan:
         if self.move_files:
             if not src_exists:
                 self.block(f"source directory does not exist: {self.src}", fatal=True)
-            if os.path.exists(self.dst) and not dst_exists:
+            # lexists, not exists: a dangling symlink is not a directory but
+            # still makes the move fail, and exists() follows the link
+            if os.path.lexists(self.dst) and not dst_exists:
                 self.block(f"destination exists and is not a directory: {self.dst}", fatal=True)
             if src_exists and self.src == self.dst:
                 # e.g. moving a project into its own parent directory; the
