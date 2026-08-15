@@ -347,6 +347,143 @@ def test_destination_is_a_directory(root):
        "refused before taking a backup")
 
 
+def add_project(home, path, sid):
+    """A second project in an existing fixture home: folder, state dir with one
+    transcript and a memory file, and a ~/.claude.json entry."""
+    os.makedirs(path, exist_ok=True)
+    open(os.path.join(path, "main.py"), "w").write(f"# {os.path.basename(path)}\n")
+    state = os.path.join(home, ".claude", "projects", enc(path))
+    os.makedirs(os.path.join(state, "memory"), exist_ok=True)
+    open(os.path.join(state, "memory", "notes.md"), "w").write(f"lives at {path}\n")
+    open(os.path.join(state, sid + ".jsonl"), "w").write(
+        json.dumps({"type": "system", "cwd": path, "content": f"cd {path}"}) + "\n")
+    cfg_path = os.path.join(home, ".claude.json")
+    cfg = json.load(open(cfg_path))
+    cfg["projects"][path] = {"allowedTools": [f"Bash({os.path.basename(path)}:*)"]}
+    json.dump(cfg, open(cfg_path, "w"))
+    return path
+
+
+def three_projects(root, tag):
+    """A home with my_app plus two sibling services, and an empty ~/archive."""
+    home, old, _, _ = fixture(root, tag)
+    dev = os.path.dirname(old)
+    api = add_project(home, os.path.join(dev, "api-service"), "cccc-3333")
+    web = add_project(home, os.path.join(dev, "web-service"), "dddd-4444")
+    archive = os.path.join(home, "archive")
+    os.makedirs(archive, exist_ok=True)
+    return home, old, api, web, archive
+
+
+def landed_ok(home, srcs, archive, label):
+    """Every src ended up at <archive>/<its own name>, state and all."""
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    for src in srcs:
+        name = os.path.basename(src)
+        dest = os.path.join(archive, name)
+        ok(os.path.exists(os.path.join(dest, "main.py")), f"{label}: {name} folder moved")
+        ok(dest in cfg["projects"] and src not in cfg["projects"],
+           f"{label}: {name} config key renamed")
+        ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(dest))),
+           f"{label}: {name} state dir follows")
+
+
+def test_multiple_sources(root):
+    print("== several projects into one directory ==")
+    home, old, api, web, archive = three_projects(root, "multi")
+    result = run(home, old, api, web, archive, "-y")
+    ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:300]})")
+    landed_ok(home, [old, api, web], archive, "multi")
+
+    state = os.path.join(home, ".claude", "projects", enc(os.path.join(archive, "api-service")))
+    ok(os.path.join(archive, "api-service") in
+       open(os.path.join(state, "memory", "notes.md")).read(),
+       "multi: each project's own memory rewritten")
+    sub = os.path.join(archive, "my_app", "packages", "core")
+    ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(sub))),
+       "multi: subprojects still remapped inside a batch")
+    backups = os.listdir(os.path.join(home, ".claude", "claude-move-backups"))
+    ok(len(backups) == 1, f"multi: one backup for the whole batch (got {len(backups)})")
+
+    leftover = subprocess.run(
+        ["grep", "-rl", os.path.dirname(old) + "/",
+         os.path.join(home, ".claude.json"), os.path.join(home, ".claude", "projects")],
+        capture_output=True, text=True).stdout
+    ok(not leftover, f"multi: no stale references remain ({leftover.strip()[:200]})")
+
+
+def test_wildcards(root):
+    print("== wildcards ==")
+    home, old, api, web, archive = three_projects(root, "glob")
+    pattern = os.path.join(os.path.dirname(old), "*-service")
+    # run() goes through subprocess without a shell, so the pattern arrives
+    # literally -- exactly as if the user had quoted it
+    result = run(home, pattern, archive, "-y")
+    ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:300]})")
+    landed_ok(home, [api, web], archive, "glob")
+    ok(os.path.isdir(old), "glob: non-matching project left alone")
+    ok(not os.path.exists(os.path.join(archive, "my_app")), "glob: only matches moved")
+
+    print("== a wildcard matching nothing ==")
+    home, old, _, _, archive = three_projects(root, "glob-none")
+    result = run(home, os.path.join(os.path.dirname(old), "nope-*"), archive, "-y")
+    ok(result.returncode == 2 and "no directories match" in result.stderr,
+       "a pattern matching nothing is an error")
+    ok(os.path.isdir(old) and not os.listdir(archive), "nothing changed")
+
+    print("== a wildcard whose folders were already moved by hand ==")
+    home, old, _, _ = fixture(root, "glob-moved")
+    dest = os.path.join(home, "work")
+    os.makedirs(dest, exist_ok=True)
+    shutil.move(old, dest)
+    result = run(home, os.path.join(os.path.dirname(old), "my_*"), dest, "-y")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    landed = os.path.join(dest, "my_app")
+    ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:300]})")
+    ok(landed in cfg["projects"],
+       "pattern falls back to Claude's known projects when the folder is gone")
+    ok(f"{landed}/packages/core" in cfg["projects"] and
+       f"{dest}/packages/core" not in cfg["projects"],
+       "the subproject was remapped once, not matched by the pattern itself")
+
+
+def test_batch_blockers(root):
+    print("== batch blockers ==")
+    home, old, api, web, archive = three_projects(root, "batch-same-name")
+    twin = add_project(home, os.path.join(home, "other", "api-service"), "eeee-5555")
+    result = run(home, api, twin, archive, "-y")
+    ok(result.returncode != 0 and "land on" in result.stderr,
+       "two projects with the same name are refused")
+    ok(os.path.isdir(api) and os.path.isdir(twin), "nothing moved")
+    ok(not os.path.isdir(os.path.join(home, ".claude", "claude-move-backups")),
+       "refused before taking a backup")
+
+    print("== a source inside another source ==")
+    home, old, _, _, archive = three_projects(root, "batch-nested")
+    inner = os.path.join(old, "packages", "core")
+    result = run(home, old, inner, archive, "-y")
+    ok(result.returncode != 0 and "is inside" in result.stderr,
+       "a nested source is refused")
+    ok(os.path.isdir(old), "nothing moved")
+
+    print("== the destination must be a real directory for a batch ==")
+    home, old, api, _, _ = three_projects(root, "batch-nodir")
+    result = run(home, old, api, os.path.join(home, "nope"), "-y")
+    ok(result.returncode == 2 and "existing directory" in result.stderr,
+       "a batch into a non-existent directory is refused")
+    ok(os.path.isdir(old) and os.path.isdir(api), "nothing moved")
+
+    print("== one bad project stops the whole batch ==")
+    home, old, api, web, archive = three_projects(root, "batch-allornothing")
+    json.dump({"pid": os.getpid(), "cwd": web, "name": "live-one"},
+              open(os.path.join(home, ".claude", "sessions", "999999.json"), "w"))
+    result = run(home, old, api, web, archive, "-y")
+    ok(result.returncode != 0 and "live" in result.stderr, "the live session blocks")
+    ok(os.path.isdir(old) and os.path.isdir(api) and os.path.isdir(web),
+       "the unaffected projects were left alone too (all or nothing)")
+    ok(not os.listdir(archive), "destination untouched")
+
+
 def test_list(root):
     print("== --list ==")
     home, old, _, _ = fixture(root, "list")
@@ -361,6 +498,7 @@ def main():
     try:
         for test in (test_core_migration, test_dry_run, test_merge, test_blockers,
                      test_already_moved, test_destination_is_a_directory,
+                     test_multiple_sources, test_wildcards, test_batch_blockers,
                      test_escaped_non_ascii, test_list):
             test(root)
     finally:

@@ -49,6 +49,28 @@ holds `~/.claude.json` in memory and writes it back when it exits, which would
 undo half the migration. The script checks for this and refuses rather than
 letting it happen.
 
+## Moving several at once
+
+Pass any number of projects followed by an existing directory, exactly like
+`mv`. Each keeps its own name inside it.
+
+```bash
+./claude-move.py ~/dev/api ~/dev/web ~/archive     # three named paths
+./claude-move.py ~/dev/*-service ~/archive         # the shell expands this
+./claude-move.py '~/dev/*-service' ~/archive       # quoted: expanded by the tool
+```
+
+Wildcards normally never reach the script — your shell expands them first, and
+that works with no special support. Quoting one hands the pattern over instead,
+which is what you want when the folders have already been moved by hand: a
+pattern that matches nothing on disk is matched against the projects Claude
+still holds state for, so `--state-only` runs can use wildcards too.
+
+A batch is all-or-nothing. Every project is planned before any of them is
+touched, so a live session in the last one stops the first from moving, and one
+safety copy covers the whole run. Two projects that would land on the same name,
+or one nested inside another, are refused.
+
 ## What moves
 
 | State | Where it lives |
@@ -137,8 +159,8 @@ python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
 ```
 
 The suite builds a synthetic `~/.claude` mirroring the real layout and checks
-the full migration, subprojects, merging, blockers, and `--dry-run` being
-read-only. Your real `~/.claude` is never touched.
+the full migration, subprojects, merging, wildcards, batch moves, blockers, and
+`--dry-run` being read-only. Your real `~/.claude` is never touched.
 
 ## License
 
