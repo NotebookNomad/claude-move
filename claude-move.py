@@ -60,6 +60,10 @@ SKIP_TOP_LEVEL = {"projects", "file-history", "claude-move-backups"}
 # which directory a session ran in
 CWD_SCAN_LINES = 400
 
+# why two different paths can share one state directory; said wherever a
+# collision is reported, so the two messages cannot drift apart
+COLLAPSE_NOTE = "Claude collapses _, spaces and . to -"
+
 # ---------------------------------------------------------------------------
 # path encoding
 # ---------------------------------------------------------------------------
@@ -414,11 +418,6 @@ class Plan:
         self._check_collisions(projects)
         self._check_state_dest()
 
-    def locate(self, path: str) -> str:
-        """Where a file found during planning lives now -- targets inside the
-        project moved along with it."""
-        return remap(path, self.src, self.dst) if is_under(path, self.src) else path
-
     def _resolve_destination(self) -> None:
         """`mv` semantics: an existing directory is a container, so
         `claude-move ~/dev/api ~/work` lands the project at ~/work/api.
@@ -582,7 +581,7 @@ class Plan:
             if shared:
                 self.log.warn(
                     f"{old} shares its state directory with: {', '.join(sorted(shared))}\n"
-                    f"           (Claude collapses _, spaces and . to -).  Their transcripts "
+                    f"           ({COLLAPSE_NOTE}).  Their transcripts "
                     f"will move too.")
             clashes = by_encoded.get(encode_path(new), set()) - {new, old}
             if clashes:
@@ -602,8 +601,8 @@ class Plan:
     def shorten(self, path: str) -> str:
         return tilde(path, self.home) or path
 
-    def summary(self) -> str:
-        """One line of substance for a batch listing."""
+    def describe_compact(self) -> None:
+        """Two lines for a batch listing, where the full form would bury it."""
         bits = []
         if not self.move_files:
             bits.append("folder already in place")
@@ -614,15 +613,11 @@ class Plan:
         if len(self.mappings) > 1:
             bits.append(f"{len(self.mappings) - 1} subproject(s)")
         bits.append(f"{len(self.targets)} file(s) rewritten")
-        return "; ".join(bits)
+        self.log.step(f"{self.shorten(self.src)}  ->  {self.shorten(self.dst)}")
+        self.log.step(f"    {'; '.join(bits)}")
 
-    def describe(self, compact: bool = False) -> None:
+    def describe(self) -> None:
         log = self.log
-        if compact:
-            log.step(f"{self.shorten(self.src)}  ->  {self.shorten(self.dst)}")
-            log.step(f"    {self.summary()}")
-            return
-
         log.info()
         log.info("Project")
         log.info(f"  from  {self.src}")
@@ -741,7 +736,9 @@ class Mover:
 
     def rewrite_everything(self) -> None:
         for target in self.plan.targets:
-            path = self.plan.locate(target)   # it may have moved since planning
+            # targets inside the project moved along with it
+            path = (remap(target, self.plan.src, self.plan.dst)
+                    if is_under(target, self.plan.src) else target)
             if not os.path.isfile(path):
                 continue
             if path == self.layout.config:
@@ -938,22 +935,17 @@ class Batch:
         self.plans = [Plan(args, layout, log, src, dst, len(sources) > 1)
                       for src in sources]
         self.blockers: List[Tuple[str, bool]] = []
+        self.done: List[Mover] = []   # filled by run(), readable after a failure
 
     def build(self, projects: Set[str]) -> None:
         for plan in self.plans:
             plan.build(projects)
         self._check_batch()
-
-    @property
-    def all_blockers(self) -> List[Tuple[str, bool]]:
-        return self.blockers + [b for plan in self.plans for b in plan.blockers]
+        self.blockers.extend(b for plan in self.plans for b in plan.blockers)
 
     def _check_batch(self) -> None:
         """Problems that only exist between projects, so no single plan sees
-        them."""
-        if len(self.plans) < 2:
-            return
-
+        them.  Every check below is naturally vacuous for a single plan."""
         for i, plan in enumerate(self.plans):
             for other in self.plans[:i]:
                 if is_under(plan.src, other.src):
@@ -972,8 +964,8 @@ class Batch:
             if len(dsts) > 1:
                 # not fatal: the move itself works, but the two projects end up
                 # sharing one state directory, which is rarely what was meant
-                self.block("these new paths share a single state directory "
-                           "(Claude collapses _, spaces and . to -):\n           "
+                self.block(f"these new paths share a single state directory "
+                           f"({COLLAPSE_NOTE}):\n           "
                            + "\n           ".join(dsts) +
                            "\n           their transcripts would be combined.")
 
@@ -996,7 +988,7 @@ class Batch:
         self.log.info(f"{len(self.plans)} projects  ->  {self.dst}")
         for plan in self.plans:
             self.log.info()
-            plan.describe(compact=True)
+            plan.describe_compact()
 
     # -- execution --------------------------------------------------------
 
@@ -1027,10 +1019,9 @@ class Batch:
                                         dirs_exist_ok=True)
         return root
 
-    def run(self) -> List[Mover]:
-        """Execute each plan in turn.  Returns the movers that finished, so a
-        failure partway can still report what did land."""
-        done: List[Mover] = []
+    def run(self) -> None:
+        """Execute each plan in turn, recording the movers that finished in
+        self.done so a failure partway can still report what did land."""
         for plan in self.plans:
             if len(self.plans) > 1:
                 self.log.info()
@@ -1042,15 +1033,45 @@ class Batch:
                 mover.rewrite_everything()
             except Exception as exc:  # noqa: BLE001 - reported, then re-raised
                 self.log.error(f"failed partway through, on {plan.src}: {exc}")
-                raise BatchFailure(done) from exc
-            done.append(mover)
-        return done
+                raise
+            self.done.append(mover)
 
+    # -- result -----------------------------------------------------------
 
-class BatchFailure(Exception):
-    def __init__(self, done: List[Mover]) -> None:
-        super().__init__("batch failed partway through")
-        self.done = done
+    def report(self) -> None:
+        log, movers = self.log, self.done
+        log.info()
+        log.info("Done")
+        if len(movers) == 1:
+            log.step(movers[0].plan.dst)
+            log.step(f"state dir: {self.layout.state_dir(movers[0].plan.dst)}")
+        else:
+            for mover in movers:
+                log.step(mover.plan.dst)
+        log.step(f"{sum(m.files_rewritten for m in movers)} file(s) rewritten, "
+                 f"{sum(m.backups_renamed for m in movers)} file-history backup(s) renamed")
+
+        conflicts = [c for m in movers for c in m.conflicts]
+        if conflicts:
+            log.info()
+            log.info("Merge conflicts kept side by side (review these):")
+            for item in conflicts:
+                log.step(item)
+
+        stale = [s for m in movers for s in m.verify()]
+        if stale:
+            log.info()
+            log.info("Still referencing the old path (probably harmless, e.g. quoted text):")
+            for item in stale[:20]:
+                log.step(item)
+            if len(stale) > 20:
+                log.step(f"... and {len(stale) - 20} more")
+
+        log.info()
+        if len(movers) == 1:
+            log.info(f"Start Claude there with:  cd {movers[0].plan.dst} && claude --continue")
+        else:
+            log.info("Start Claude in any of them with:  cd <path> && claude --continue")
 
 
 # ---------------------------------------------------------------------------
@@ -1079,26 +1100,29 @@ def expand_sources(patterns: Iterable[str], projects: Set[str],
     match projects whose folders are already gone -- those are matched against
     the paths Claude still holds state for rather than against the filesystem.
     """
-    out: List[str] = []
+    out: Dict[str, None] = {}   # an ordered set: a path named twice is one move
+    empty: List[str] = []
     for pattern in patterns:
         if not _GLOB_MAGIC.search(pattern):
-            out.append(norm(pattern))
+            out[norm(pattern)] = None
             continue
-        expanded = norm(pattern)
         matches = sorted(norm(p) for p in glob.glob(os.path.expanduser(pattern))
                          if os.path.isdir(p))
         if not matches:
             # nothing on disk -- the folders may already have been moved by
             # hand, so fall back to what Claude still knows about
-            matches = sorted(p for p in projects if glob_match(p, expanded))
+            matches = sorted(p for p in projects if glob_match(p, norm(pattern)))
         if not matches:
-            log.error(f"no directories match: {pattern}")
-            return None
+            # keep going: report every dead pattern at once rather than making
+            # the user fix them one run at a time
+            empty.append(pattern)
+            continue
         log.info(f"{pattern} -> {len(matches)} match(es)")
-        out.extend(matches)
+        out.update(dict.fromkeys(matches))
 
-    seen: Set[str] = set()
-    return [p for p in out if not (p in seen or seen.add(p))]
+    for pattern in empty:
+        log.error(f"no directories match: {pattern}")
+    return None if empty else list(out)
 
 
 def cmd_list(layout: Layout, log: Log) -> int:
@@ -1187,28 +1211,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     *patterns, dst = args.paths
+    dst = norm(dst)
     projects = known_projects(layout)   # a scan of every transcript; do it once
     sources = expand_sources(patterns, projects, log)
     if sources is None:
         return 2
-    if any(src == norm(dst) for src in sources):
+    if dst in sources:
         log.error("source and destination are the same path")
         return 2
-    if len(sources) > 1 and not os.path.isdir(norm(dst)):
+    if len(sources) > 1 and not os.path.isdir(dst):
         log.error(f"moving {len(sources)} projects at once needs an existing "
-                  f"directory to move them into: {norm(dst)}")
+                  f"directory to move them into: {dst}")
         return 2
 
     batch = Batch(args, layout, log, sources, dst)
     batch.build(projects)
     batch.describe()
 
-    blockers = batch.all_blockers
-    if blockers:
+    if batch.blockers:
         log.info()
-        for message, _fatal in blockers:
+        for message, _fatal in batch.blockers:
             log.error(f"blocked: {message}")
-        fatal = any(fatal for _, fatal in blockers)
+        fatal = any(fatal for _, fatal in batch.blockers)
         if fatal or not args.force:
             log.info()
             log.error("nothing was changed." + ("  this cannot be overridden." if fatal
@@ -1231,51 +1255,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.step(f"backed up current state to {backup}")
 
     try:
-        movers = batch.run()
-    except BatchFailure as failure:
-        for mover in failure.done:
+        batch.run()
+    except Exception:  # noqa: BLE001 - already reported; point at the backup
+        for mover in batch.done:
             log.error(f"already completed: {mover.plan.dst}")
         if backup:
             log.error(f"a copy of the original state is at {backup}")
-        raise failure.__cause__ or failure
+        raise
 
-    report(batch, movers, log)
+    batch.report()
     return 0
-
-
-def report(batch: Batch, movers: List[Mover], log: Log) -> None:
-    log.info()
-    log.info("Done")
-    if len(movers) == 1:
-        log.step(f"{movers[0].plan.dst}")
-        log.step(f"state dir: {batch.layout.state_dir(movers[0].plan.dst)}")
-    else:
-        for mover in movers:
-            log.step(mover.plan.dst)
-    log.step(f"{sum(m.files_rewritten for m in movers)} file(s) rewritten, "
-             f"{sum(m.backups_renamed for m in movers)} file-history backup(s) renamed")
-
-    conflicts = [c for m in movers for c in m.conflicts]
-    if conflicts:
-        log.info()
-        log.info("Merge conflicts kept side by side (review these):")
-        for item in conflicts:
-            log.step(item)
-
-    stale = [s for m in movers for s in m.verify()]
-    if stale:
-        log.info()
-        log.info("Still referencing the old path (probably harmless, e.g. quoted text):")
-        for item in stale[:20]:
-            log.step(item)
-        if len(stale) > 20:
-            log.step(f"... and {len(stale) - 20} more")
-
-    log.info()
-    if len(movers) == 1:
-        log.info(f"Start Claude there with:  cd {movers[0].plan.dst} && claude --continue")
-    else:
-        log.info("Start Claude in any of them with:  cd <path> && claude --continue")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,46 @@ def fixture(root, tag):
     return home, proj, sub, sid
 
 
+def add_project(home, path, sid):
+    """A second project in an existing fixture home: folder, state dir with one
+    transcript and a memory file, and a ~/.claude.json entry."""
+    os.makedirs(path, exist_ok=True)
+    open(os.path.join(path, "main.py"), "w").write(f"# {os.path.basename(path)}\n")
+    state = os.path.join(home, ".claude", "projects", enc(path))
+    os.makedirs(os.path.join(state, "memory"), exist_ok=True)
+    open(os.path.join(state, "memory", "notes.md"), "w").write(f"lives at {path}\n")
+    open(os.path.join(state, sid + ".jsonl"), "w").write(
+        json.dumps({"type": "system", "cwd": path, "content": f"cd {path}"}) + "\n")
+    cfg_path = os.path.join(home, ".claude.json")
+    cfg = json.load(open(cfg_path))
+    cfg["projects"][path] = {"allowedTools": [f"Bash({os.path.basename(path)}:*)"]}
+    json.dump(cfg, open(cfg_path, "w"))
+    return path
+
+
+def three_projects(root, tag):
+    """A home with my_app plus two sibling services, and an empty ~/archive."""
+    home, old, _, _ = fixture(root, tag)
+    dev = os.path.dirname(old)
+    api = add_project(home, os.path.join(dev, "api-service"), "cccc-3333")
+    web = add_project(home, os.path.join(dev, "web-service"), "dddd-4444")
+    archive = os.path.join(home, "archive")
+    os.makedirs(archive, exist_ok=True)
+    return home, old, api, web, archive
+
+
+def landed_ok(home, srcs, archive, label):
+    """Every src ended up at <archive>/<its own name>, state and all."""
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    for src in srcs:
+        name = os.path.basename(src)
+        dest = os.path.join(archive, name)
+        ok(os.path.exists(os.path.join(dest, "main.py")), f"{label}: {name} folder moved")
+        ok(dest in cfg["projects"] and src not in cfg["projects"],
+           f"{label}: {name} config key renamed")
+        ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(dest))),
+           f"{label}: {name} state dir follows")
+
 def test_core_migration(root):
     print("== core migration ==")
     home, old, sub, sid = fixture(root, "core")
@@ -274,14 +314,9 @@ def test_destination_is_a_directory(root):
     container = os.path.join(home, "work")
     os.makedirs(container, exist_ok=True)
     result = run(home, old, container, "-y")
-    landed = os.path.join(container, "my_app")
     ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:200]})")
-    ok(os.path.exists(os.path.join(landed, "main.py")), "moved into the directory by name")
+    landed_ok(home, [old], container, "container")
     ok(not os.path.exists(container + "/main.py"), "did not splat contents into the container")
-    cfg = json.load(open(os.path.join(home, ".claude.json")))
-    ok(landed in cfg["projects"], "config keyed by the landed path")
-    ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(landed))),
-       "state dir follows the landed path")
 
     print("== an empty destination directory is still a container ==")
     home, old, _, _ = fixture(root, "container-empty")
@@ -347,46 +382,6 @@ def test_destination_is_a_directory(root):
        "refused before taking a backup")
 
 
-def add_project(home, path, sid):
-    """A second project in an existing fixture home: folder, state dir with one
-    transcript and a memory file, and a ~/.claude.json entry."""
-    os.makedirs(path, exist_ok=True)
-    open(os.path.join(path, "main.py"), "w").write(f"# {os.path.basename(path)}\n")
-    state = os.path.join(home, ".claude", "projects", enc(path))
-    os.makedirs(os.path.join(state, "memory"), exist_ok=True)
-    open(os.path.join(state, "memory", "notes.md"), "w").write(f"lives at {path}\n")
-    open(os.path.join(state, sid + ".jsonl"), "w").write(
-        json.dumps({"type": "system", "cwd": path, "content": f"cd {path}"}) + "\n")
-    cfg_path = os.path.join(home, ".claude.json")
-    cfg = json.load(open(cfg_path))
-    cfg["projects"][path] = {"allowedTools": [f"Bash({os.path.basename(path)}:*)"]}
-    json.dump(cfg, open(cfg_path, "w"))
-    return path
-
-
-def three_projects(root, tag):
-    """A home with my_app plus two sibling services, and an empty ~/archive."""
-    home, old, _, _ = fixture(root, tag)
-    dev = os.path.dirname(old)
-    api = add_project(home, os.path.join(dev, "api-service"), "cccc-3333")
-    web = add_project(home, os.path.join(dev, "web-service"), "dddd-4444")
-    archive = os.path.join(home, "archive")
-    os.makedirs(archive, exist_ok=True)
-    return home, old, api, web, archive
-
-
-def landed_ok(home, srcs, archive, label):
-    """Every src ended up at <archive>/<its own name>, state and all."""
-    cfg = json.load(open(os.path.join(home, ".claude.json")))
-    for src in srcs:
-        name = os.path.basename(src)
-        dest = os.path.join(archive, name)
-        ok(os.path.exists(os.path.join(dest, "main.py")), f"{label}: {name} folder moved")
-        ok(dest in cfg["projects"] and src not in cfg["projects"],
-           f"{label}: {name} config key renamed")
-        ok(os.path.isdir(os.path.join(home, ".claude", "projects", enc(dest))),
-           f"{label}: {name} state dir follows")
-
 
 def test_multiple_sources(root):
     print("== several projects into one directory ==")
@@ -426,10 +421,17 @@ def test_wildcards(root):
 
     print("== a wildcard matching nothing ==")
     home, old, _, _, archive = three_projects(root, "glob-none")
-    result = run(home, os.path.join(os.path.dirname(old), "nope-*"), archive, "-y")
+    dev = os.path.dirname(old)
+    result = run(home, os.path.join(dev, "nope-*"), archive, "-y")
     ok(result.returncode == 2 and "no directories match" in result.stderr,
        "a pattern matching nothing is an error")
     ok(os.path.isdir(old) and not os.listdir(archive), "nothing changed")
+
+    # every dead pattern at once, so the user does not fix them one run at a time
+    result = run(home, os.path.join(dev, "aa-*"), os.path.join(dev, "bb-*"),
+                 os.path.join(dev, "cc-*"), archive, "-y")
+    ok(result.stderr.count("no directories match") == 3,
+       f"all three dead patterns reported (got {result.stderr.count('no directories match')})")
 
     print("== a wildcard whose folders were already moved by hand ==")
     home, old, _, _ = fixture(root, "glob-moved")
@@ -449,7 +451,7 @@ def test_wildcards(root):
 
 def test_batch_blockers(root):
     print("== batch blockers ==")
-    home, old, api, web, archive = three_projects(root, "batch-same-name")
+    home, _, api, _, archive = three_projects(root, "batch-same-name")
     twin = add_project(home, os.path.join(home, "other", "api-service"), "eeee-5555")
     result = run(home, api, twin, archive, "-y")
     ok(result.returncode != 0 and "land on" in result.stderr,
