@@ -406,6 +406,16 @@ def test_multiple_sources(root):
         capture_output=True, text=True).stdout
     ok(not leftover, f"multi: no stale references remain ({leftover.strip()[:200]})")
 
+    print("== several projects moved in by hand, then --state-only ==")
+    home, old, api, web, archive = three_projects(root, "multi-stateonly")
+    for src in (old, api, web):
+        shutil.move(src, os.path.join(archive, os.path.basename(src)))
+    result = run(home, old, api, web, archive, "--state-only", "-y")
+    ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:200]})")
+    landed_ok(home, [old, api, web], archive, "state-only")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    ok(archive not in cfg["projects"], "state-only: container did not become a project")
+
 
 def test_wildcards(root):
     print("== wildcards ==")
@@ -432,6 +442,19 @@ def test_wildcards(root):
                  os.path.join(dev, "cc-*"), archive, "-y")
     ok(result.stderr.count("no directories match") == 3,
        f"all three dead patterns reported (got {result.stderr.count('no directories match')})")
+
+    print("== a folder whose real name contains glob characters ==")
+    home, old, _, _ = fixture(root, "glob-literal")
+    literal = os.path.join(os.path.dirname(old), "notes[2024]")
+    add_project(home, literal, "ffff-6666")
+    dest = os.path.join(home, "archive")
+    os.makedirs(dest, exist_ok=True)
+    result = run(home, literal, dest, "-y")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    landed = os.path.join(dest, "notes[2024]")
+    ok(result.returncode == 0, f"exit 0 (stderr: {result.stderr.strip()[:200]})")
+    ok(os.path.isdir(landed) and landed in cfg["projects"],
+       "a real directory named like a pattern is taken literally")
 
     print("== a wildcard whose folders were already moved by hand ==")
     home, old, _, _ = fixture(root, "glob-moved")
@@ -460,13 +483,17 @@ def test_batch_blockers(root):
     ok(not os.path.isdir(os.path.join(home, ".claude", "claude-move-backups")),
        "refused before taking a backup")
 
-    print("== a source inside another source ==")
-    home, old, _, _, archive = three_projects(root, "batch-nested")
-    inner = os.path.join(old, "packages", "core")
-    result = run(home, old, inner, archive, "-y")
-    ok(result.returncode != 0 and "is inside" in result.stderr,
-       "a nested source is refused")
-    ok(os.path.isdir(old), "nothing moved")
+    print("== a source inside another source, named in either order ==")
+    for order in ("outer first", "inner first"):
+        home, old, _, _, archive = three_projects(root, "batch-nested-" + order[:5])
+        inner = os.path.join(old, "packages", "core")
+        pair = [old, inner] if order == "outer first" else [inner, old]
+        result = run(home, *pair, archive, "-y")
+        ok(result.returncode != 0 and "is inside" in result.stderr,
+           f"{order}: a nested source is refused")
+        ok("Traceback" not in result.stderr, f"{order}: refused cleanly, not crashed into")
+        ok(os.path.isdir(inner) and not os.path.isdir(os.path.join(archive, "core")),
+           f"{order}: nothing moved")
 
     print("== the destination must be a real directory for a batch ==")
     home, old, api, _, _ = three_projects(root, "batch-nodir")
@@ -474,6 +501,27 @@ def test_batch_blockers(root):
     ok(result.returncode == 2 and "existing directory" in result.stderr,
        "a batch into a non-existent directory is refused")
     ok(os.path.isdir(old) and os.path.isdir(api), "nothing moved")
+
+    print("== a batched source whose folder went somewhere else entirely ==")
+    home, old, api, web, archive = three_projects(root, "batch-strayed")
+    shutil.move(web, os.path.join(home, "elsewhere"))
+    result = run(home, api, web, archive, "-y")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    ok(result.returncode != 0 and "does not exist" in result.stderr,
+       "a source that is not where it was named is refused")
+    ok(archive not in cfg["projects"], "the container did not become a project")
+    ok(not os.path.isdir(os.path.join(home, ".claude", "projects", enc(archive))),
+       "no state directory was created for the container")
+    ok(os.path.isdir(api), "the healthy project was left alone")
+
+    print("== the destination swept up by its own wildcard ==")
+    home, old, _, _, _ = three_projects(root, "batch-dst-in-glob")
+    dev = os.path.dirname(old)
+    inside = os.path.join(dev, "archive")
+    os.makedirs(inside, exist_ok=True)
+    result = run(home, os.path.join(dev, "*"), inside, "-y")
+    ok(result.returncode == 2 and "also one of the sources" in result.stderr,
+       "says the destination was matched by the pattern, not just 'same path'")
 
     print("== one bad project stops the whole batch ==")
     home, old, api, web, archive = three_projects(root, "batch-allornothing")

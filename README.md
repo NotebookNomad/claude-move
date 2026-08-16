@@ -66,10 +66,12 @@ which is what you want when the folders have already been moved by hand: a
 pattern that matches nothing on disk is matched against the projects Claude
 still holds state for, so `--state-only` runs can use wildcards too.
 
-A batch is all-or-nothing. Every project is planned before any of them is
-touched, so a live session in the last one stops the first from moving, and one
-safety copy covers the whole run. Two projects that would land on the same name,
-or one nested inside another, are refused.
+Every project is planned before any of them is touched, so anything that would
+block one — a live session, two projects that would land on the same name, one
+nested inside another, a folder that is not where you said it was — stops the
+whole batch before it starts. One safety copy covers the run. If a move still
+fails partway through, it names the projects that already completed and points
+at that copy.
 
 ## What moves
 

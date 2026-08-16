@@ -422,12 +422,21 @@ class Plan:
         """`mv` semantics: an existing directory is a container, so
         `claude-move ~/dev/api ~/work` lands the project at ~/work/api.
 
-        Not applied when the folder is already at the destination (--state-only,
-        or auto-detected because the source is gone).  There the destination
-        names the project itself, and treating it as a container would nest it
-        one level deeper than the user meant.
+        For a single move this is not applied when the folder is already at the
+        destination (--state-only, or auto-detected because the source is gone):
+        there the destination names the project itself, and treating it as a
+        container would nest it one level deeper than the user meant.
         """
         landed = os.path.join(self.dst, os.path.basename(self.src))
+
+        if self.batched:
+            # Several sources can only mean a container -- main requires the
+            # destination to be an existing directory -- so every project lands
+            # at <dst>/<its own name>.  This holds under --state-only and when
+            # the folder is already gone; without it, a project whose folder had
+            # been moved elsewhere would rewrite its state onto the container.
+            self.dst = landed
+            return
 
         if not os.path.isdir(self.src):
             # The folder is already gone, so it was moved by hand -- and `mv`
@@ -446,8 +455,6 @@ class Plan:
             return
 
         container, self.dst = self.dst, landed
-        if self.batched:
-            return   # moving several projects always means "into this directory"
         note = (f"{container} is an existing directory -- "
                 f"moving into it as {os.path.basename(self.dst)}")
         if os.listdir(container):
@@ -948,8 +955,14 @@ class Batch:
         them.  Every check below is naturally vacuous for a single plan."""
         for i, plan in enumerate(self.plans):
             for other in self.plans[:i]:
-                if is_under(plan.src, other.src):
-                    self.block(f"{plan.src} is inside {other.src} -- it would be moved "
+                # both directions: the inner project may be named first, and
+                # then the outer plan's own subproject remapping collides with
+                # the move the inner one already made
+                pair = ((plan.src, other.src) if is_under(plan.src, other.src)
+                        else (other.src, plan.src) if is_under(other.src, plan.src)
+                        else None)
+                if pair:
+                    self.block(f"{pair[0]} is inside {pair[1]} -- it would be moved "
                                f"twice.\n           drop the inner one; it is remapped "
                                f"as a subproject anyway.", fatal=True)
 
@@ -1103,15 +1116,19 @@ def expand_sources(patterns: Iterable[str], projects: Set[str],
     out: Dict[str, None] = {}   # an ordered set: a path named twice is one move
     empty: List[str] = []
     for pattern in patterns:
-        if not _GLOB_MAGIC.search(pattern):
-            out[norm(pattern)] = None
+        literal = norm(pattern)
+        # a real project whose name happens to contain [ * or ? is a path, not
+        # a pattern; taking it literally keeps such folders movable
+        if (not _GLOB_MAGIC.search(pattern)
+                or os.path.isdir(literal) or literal in projects):
+            out[literal] = None
             continue
         matches = sorted(norm(p) for p in glob.glob(os.path.expanduser(pattern))
                          if os.path.isdir(p))
         if not matches:
             # nothing on disk -- the folders may already have been moved by
             # hand, so fall back to what Claude still knows about
-            matches = sorted(p for p in projects if glob_match(p, norm(pattern)))
+            matches = sorted(p for p in projects if glob_match(p, literal))
         if not matches:
             # keep going: report every dead pattern at once rather than making
             # the user fix them one run at a time
@@ -1217,7 +1234,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if sources is None:
         return 2
     if dst in sources:
-        log.error("source and destination are the same path")
+        # a wildcard covering the destination's own parent sweeps it up, and
+        # "same path" alone does not explain where it came from
+        log.error(f"the destination is also one of the sources: {dst}"
+                  if len(sources) > 1 else "source and destination are the same path")
         return 2
     if len(sources) > 1 and not os.path.isdir(dst):
         log.error(f"moving {len(sources)} projects at once needs an existing "
