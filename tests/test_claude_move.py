@@ -534,6 +534,39 @@ def test_batch_blockers(root):
     ok(not os.listdir(archive), "destination untouched")
 
 
+def test_prefix_siblings(root):
+    """A neighbour that merely starts with the same characters is a different
+    project.  Plain substring replacement used to drag it along."""
+    print("== a neighbour sharing the moved project's name prefix ==")
+    for suffix in ("-server", "2", "_old", ".bak"):
+        home, old, _, _ = fixture(root, "prefix" + suffix)
+        sib = add_project(home, old + suffix, "gggg-7777")
+        with open(os.path.join(home, ".claude", "history.jsonl"), "a") as fh:
+            fh.write(json.dumps({"display": "sib", "project": sib}) + "\n")
+        new = os.path.join(home, "work", "api")
+        run(home, old, new, "-y")
+        cfg = json.load(open(os.path.join(home, ".claude.json")))
+        hist = [json.loads(l) for l in open(os.path.join(home, ".claude", "history.jsonl"))]
+        tag = [h["project"] for h in hist if h["display"] == "sib"][0]
+        name = os.path.basename(sib)
+        ok(sib in cfg["projects"], f"{name}: config entry left alone")
+        ok(tag == sib, f"{name}: history entry left alone")
+        ok(new in cfg["projects"], f"{name}: the named project still moved")
+
+    print("== boundaries that must still match ==")
+    home, old, _, _ = fixture(root, "prefix-ok")
+    new = os.path.join(home, "work", "api")
+    run(home, old, new, "-y")
+    cfg = json.load(open(os.path.join(home, ".claude.json")))
+    state = os.path.join(home, ".claude", "projects", enc(new))
+    ok(os.path.join(new, "packages", "core") in cfg["projects"], "a child path still matches")
+    ok(new in open(os.path.join(state, "memory", "deploy.md")).read(),
+       "a path ending a sentence in prose still matches")
+    ok(json.load(open(os.path.join(home, ".claude", "jobs", "job1",
+                                   "state.json")))["cwd"] == new,
+       "a path followed by a quote still matches")
+
+
 def test_list(root):
     print("== --list ==")
     home, old, _, _ = fixture(root, "list")
@@ -549,7 +582,7 @@ def main():
         for test in (test_core_migration, test_dry_run, test_merge, test_blockers,
                      test_already_moved, test_destination_is_a_directory,
                      test_multiple_sources, test_wildcards, test_batch_blockers,
-                     test_escaped_non_ascii, test_list):
+                     test_escaped_non_ascii, test_prefix_siblings, test_list):
             test(root)
     finally:
         if not keep:

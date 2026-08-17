@@ -69,6 +69,13 @@ COLLAPSE_NOTE = "Claude collapses _, spaces and . to -"
 # ---------------------------------------------------------------------------
 
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]")
+
+# A path only matches when what follows cannot continue its last segment, so
+# "/dev/api" claims "/dev/api/pkg" and '/dev/api"' but never "/dev/api-server".
+# The second lookahead is for the dot: "api.bak" is a different directory, while
+# a path ending a sentence in a memory file ("Run it from /dev/api.") is not --
+# a dot only blocks the match when a name character follows it.
+_SEGMENT_END = r"(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9_-])"
 _CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _GLOB_MAGIC = re.compile(r"[*?\[]")
 
@@ -220,16 +227,21 @@ def unique(path: str) -> str:
 
 
 class Rewriter:
-    """Ordered set of literal string substitutions applied to every string in
-    a JSON document (keys included) or to raw text.
+    """Ordered set of path substitutions applied to every string in a JSON
+    document (keys included) or to raw text.
 
     Replacements are applied longest-old-first so that the more specific
     strings (the state directory, subproject paths) win over the shorter ones
     they contain.
+
+    A match must end on a path-segment boundary.  Plain substring replacement
+    would rewrite every neighbour that merely starts the same way: moving
+    ~/dev/api would silently re-key ~/dev/api-server, a project that was never
+    named, onto a directory that does not exist.
     """
 
     def __init__(self) -> None:
-        self._pairs: List[Tuple[str, str]] = []
+        self._pairs: List[Tuple[str, str, "re.Pattern[str]"]] = []
         self.hits = 0
 
     def add(self, old: str, new: str) -> None:
@@ -240,15 +252,17 @@ class Rewriter:
         self._add(json.dumps(old)[1:-1], json.dumps(new)[1:-1])
 
     def _add(self, old: str, new: str) -> None:
-        if old and new and old != new and (old, new) not in self._pairs:
-            self._pairs.append((old, new))
+        if old and new and old != new and not any(o == old for o, _, _ in self._pairs):
+            self._pairs.append((old, new, re.compile(re.escape(old) + _SEGMENT_END)))
             self._pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
     def text(self, value: str) -> str:
         out = value
-        for old, new in self._pairs:
-            if old in out:
-                out = out.replace(old, new)
+        for old, new, pattern in self._pairs:
+            if old in out:   # cheap guard; the regex can only match where this does
+                # a function replacement, so backslashes in `new` (the
+                # JSON-escaped spellings are full of them) stay literal
+                out = pattern.sub(lambda _match, new=new: new, out)
         if out != value:
             self.hits += 1
         return out
@@ -264,7 +278,8 @@ class Rewriter:
         return value
 
     def touches(self, blob: str) -> bool:
-        return any(old in blob for old, _ in self._pairs)
+        return any(old in blob and pattern.search(blob)
+                   for old, _, pattern in self._pairs)
 
 
 def tracked_backups(rec: Any) -> Iterator[Tuple[str, Dict[str, Any]]]:
