@@ -40,6 +40,8 @@ Usage:
     claude-move.py inspect state.tar.gz           # what a bundle holds
     claude-move.py import state.tar.gz            # unpack it there, repathed
 
+    claude-move.py repair                         # stale paths in memory files
+
 Stdlib only, Python 3.8+.
 """
 
@@ -1990,6 +1992,458 @@ def do_import(args: argparse.Namespace, layout: Layout, log: Log) -> int:
     return 0
 
 # ---------------------------------------------------------------------------
+# repair: memory files still naming a path that moved
+# ---------------------------------------------------------------------------
+
+# A path written in prose: absolute, or spelled with a leading ~.  The
+# lookbehind stops a match starting mid-token, so "and/or" is not a path and
+# neither is the "//" in a URL.
+_MENTION = re.compile(r"(?<![\w./~-])(?:~/|/)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+
+# directories the hunt for a moved project will not descend into, and the
+# limits that keep a repair from turning into a full-disk scan
+_SEARCH_SKIP = {"node_modules", "Library", "Applications", "__pycache__",
+                "target", "build", "dist", "venv", ".venv", ".git", ".cache",
+                ".Trash", ".npm", ".cargo", ".rustup", ".claude"}
+_SEARCH_DEPTH = 5
+_SEARCH_LIMIT = 40000
+
+# how many unfixable paths to print before summarising the rest
+UNKNOWN_SHOWN = 10
+
+
+def mentioned_paths(text: str, home: str) -> Dict[str, str]:
+    """Absolute path -> the spelling it was written in, for every path the
+    text names."""
+    out: Dict[str, str] = {}
+    for raw in _MENTION.findall(text):
+        spelled = raw.rstrip(".")     # a path that ended a sentence
+        if not spelled or spelled in ("~/", "/"):
+            continue
+        # "/simplify", "/mcp", "/v1" -- a single leading segment is a slash
+        # command or a fragment far more often than a directory anyone keeps
+        # a project in.  ~/foo needs no such guard: the ~ says it is a path.
+        if spelled.startswith("/") and spelled.count("/") < 2:
+            continue
+        expanded = home + spelled[1:] if spelled.startswith("~") else spelled
+        out.setdefault(norm(expanded), spelled)
+    return out
+
+
+def ancestors(path: str) -> List[str]:
+    """`path` and every directory above it, longest first, stopping at the
+    root."""
+    out = []
+    while path and path != "/" and os.path.dirname(path) != path:
+        out.append(path)
+        path = os.path.dirname(path)
+    return out
+
+
+class Clue:
+    """One path that has moved, where it went, and how we know.
+
+    `sure` separates what Claude's own state proves from what a name match
+    merely suggests, so the two can be presented differently.
+    """
+
+    def __init__(self, old: str, new: str, why: str, sure: bool) -> None:
+        self.old = old
+        self.new = new
+        self.why = why
+        self.sure = sure
+
+
+class Relocations:
+    """Where the projects Claude still names have actually gone.
+
+    Three sources, in decreasing order of certainty:
+
+      1. a state directory naming a path that no longer exists while exactly
+         one path it could belong to does -- Claude's own state proves the
+         move, so this one is certain;
+      2. a missing path whose last segment names a project that still exists
+         somewhere else;
+      3. a missing path whose last segment names exactly one directory found
+         under the home directory.
+
+    The last two are guesses.  A directory name is not an identity -- a memory
+    file may be quoting an example rather than a real location -- so they are
+    offered for the user to accept or reject rather than applied.
+    """
+
+    def __init__(self, layout: Layout, log: Log, search: bool = True) -> None:
+        self.layout = layout
+        self.log = log
+        self.search = search
+        self.clues: Dict[str, Clue] = {}
+        # one scan of every transcript, shared with whoever needs the project
+        # list afterwards
+        self.projects = known_projects(layout, log)
+        self.here = {p for p in self.projects if os.path.isdir(p)}
+        self.by_name: Dict[str, Set[str]] = {}
+        for path in self.here:
+            self.by_name.setdefault(os.path.basename(path), set()).add(path)
+        self._index: Optional[Dict[str, Set[str]]] = None
+        self._from_state_dirs()
+
+    # -- evidence ---------------------------------------------------------
+
+    def _from_state_dirs(self) -> None:
+        """The certain kind: a state directory that names both a path which is
+        gone and one which is here."""
+        cfg = read_json(self.layout.config, {}) or {}
+        keys = [norm(k) for k in (cfg.get("projects") or {})] \
+            if isinstance(cfg, dict) else []
+        for state in state_dirs(self.layout):
+            name = os.path.basename(state)
+            # a session can run with its cwd inside ~/.claude; that is not a
+            # project, and so not evidence about one either
+            claims = {cwd for cwd in cwds_in_state_dir(state)
+                      if not is_under(cwd, self.layout.dir)}
+            claims |= {key for key in keys if encode_path(key) == name}
+            here = {c for c in claims if os.path.isdir(c)}
+            here |= set(decode_state_dir(name))
+            gone = sorted(c for c in claims if not os.path.isdir(c))
+            if len(here) != 1 or not gone:
+                continue
+            new = here.pop()
+            for old in gone:
+                if old != new:
+                    self.add(Clue(old, new, "Claude's own state for that "
+                                            "project resolves to it", True))
+
+    def add(self, clue: Clue) -> None:
+        known = self.clues.get(clue.old)
+        if known is None or (clue.sure and not known.sure):
+            self.clues[clue.old] = clue
+
+    def index(self) -> Dict[str, Set[str]]:
+        """Directory name -> where directories of that name live under the
+        home directory.  Built once, and bounded in every direction: by depth,
+        by count, and by where it is willing to look.
+
+        It looks for somewhere a project could have been *moved to*, which is
+        neither inside an application's private state (a dot-directory) nor
+        inside another project -- and a project's own tree is full of common
+        names like src and tests that would match anything.  A project that
+        really did move inside another one is missed; a search that guessed
+        from a "tests" directory would be worse than useless.
+        """
+        if self._index is not None:
+            return self._index
+        self._index = {}
+        home, seen = self.layout.home, 0
+        for root, dirs, _files in os.walk(home):
+            if root[len(home):].count("/") >= _SEARCH_DEPTH:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(".") and d not in _SEARCH_SKIP]
+            for name in dirs:
+                self._index.setdefault(name, set()).add(os.path.join(root, name))
+            seen += len(dirs)
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in self.here]
+            if seen > _SEARCH_LIMIT:
+                self.log.warn(f"stopped looking for moved directories after "
+                              f"{_SEARCH_LIMIT} of them -- pass --no-search to "
+                              f"skip that search entirely")
+                break
+        return self._index
+
+    # -- resolution -------------------------------------------------------
+
+    def resolve(self, path: str) -> Optional[Clue]:
+        """Explain a path a memory file names but the disk does not have.
+
+        Only the missing part of the path can have moved: if ~/dev/api is
+        still there, ~/dev/api/gone.md is a deleted file, not a relocation.
+        """
+        missing = [a for a in ancestors(path) if not os.path.exists(a)]
+        for anc in missing:
+            if anc in self.clues:
+                return self.clues[anc]
+        for anc in missing:
+            if not self._plausible(anc):
+                continue
+            clue = self._named_project(anc) or self._searched(anc)
+            if clue:
+                self.add(clue)
+                return clue
+        return None
+
+    def _plausible(self, path: str) -> bool:
+        """Worth guessing about: a directory deep enough to be a project, and
+        not part of Claude's own state."""
+        return (not is_under(path, self.layout.dir)
+                and path != self.layout.home
+                and len(path.strip("/").split("/")) >= 2)
+
+    def _named_project(self, path: str) -> Optional[Clue]:
+        hits = self.by_name.get(os.path.basename(path), set()) - {path}
+        if len(hits) == 1:
+            return Clue(path, hits.pop(),
+                        "the only project Claude knows by that name", False)
+        return None
+
+    def _searched(self, path: str) -> Optional[Clue]:
+        if not self.search:
+            return None
+        hits = self.index().get(os.path.basename(path), set()) - {path}
+        if len(hits) == 1:
+            where = short(self.layout.home, self.layout.home)
+            return Clue(path, hits.pop(),
+                        f"the only directory by that name under {where}", False)
+        return None
+
+
+class Finding:
+    """One relocation, and the memory files that still name the old path.
+
+    A project's path appears in memory in more than one spelling -- absolute
+    and ~-relative -- and its state directory name is derived from it, so all
+    of those are rewritten together or the file is left half-corrected.
+    """
+
+    def __init__(self, clue: Clue, layout: Layout) -> None:
+        self.clue = clue
+        self.files: Dict[str, int] = {}
+        self.pairs: List[Tuple[str, str]] = [(clue.old, clue.new)]
+        state = layout.state_dir(clue.old), layout.state_dir(clue.new)
+        if state[0] != state[1]:
+            self.pairs.append(state)
+        for old, new in list(self.pairs):
+            spelled = tilde(old, layout.home)
+            if spelled:
+                self.pairs.append((spelled, tilde(new, layout.home) or new))
+        self._patterns = [re.compile(re.escape(old) + _SEGMENT_END)
+                          for old, _ in self.pairs]
+
+    def count(self, path: str, text: str) -> None:
+        hits = sum(len(p.findall(text)) for p in self._patterns)
+        if hits:
+            self.files[path] = hits
+
+    @property
+    def hits(self) -> int:
+        return sum(self.files.values())
+
+
+class Repair:
+    """A pass over memory files, looking for paths that have moved."""
+
+    def __init__(self, args: argparse.Namespace, layout: Layout, log: Log) -> None:
+        self.args = args
+        self.layout = layout
+        self.log = log
+        self.relocations = Relocations(layout, log, search=not args.no_search)
+        self.dirs = self._targets()
+        self.texts: Dict[str, str] = {}
+        self.findings: List[Finding] = []
+        self.unknown: Dict[str, Set[str]] = {}
+
+    def _targets(self) -> List[str]:
+        """State directories to read.  Naming projects narrows it; naming none
+        checks every directory that holds memory at all -- including ones no
+        config entry survives for, which is exactly where stale paths collect.
+        """
+        if self.args.projects:
+            chosen = select(self.relocations.projects, self.args.projects,
+                            self.log)
+            return sorted({d for d in chosen.values() if os.path.isdir(d)})
+        return [d for d in state_dirs(self.layout) if memory_files(d)]
+
+    def scan(self) -> None:
+        for state in self.dirs:
+            for name in memory_files(state):
+                path = os.path.join(state, name)
+                text = read_text(path)
+                if text is not None:
+                    self.texts[path] = text
+
+        # Everything Claude's own state proves has moved is worth checking for,
+        # whether or not a memory file spells it out as a path: a file may name
+        # only the state directory, which is derived from the project path
+        # rather than equal to it.  Findings nothing names are dropped below.
+        found = {clue.old: Finding(clue, self.layout)
+                 for clue in self.relocations.clues.values() if clue.sure}
+        for path, text in self.texts.items():
+            for abs_path, spelled in mentioned_paths(text, self.layout.home).items():
+                # a ~/.claude path is Claude's own state, not a project
+                # location, and never something to guess a relocation from
+                if os.path.exists(abs_path) or is_under(abs_path, self.layout.dir):
+                    continue
+                clue = self.relocations.resolve(abs_path)
+                if clue:
+                    found.setdefault(clue.old, Finding(clue, self.layout))
+                elif os.path.isdir(os.path.dirname(abs_path)):
+                    # the parent is still there and the child is not, which is
+                    # what a move looks like; a path whose whole tree is absent
+                    # is far more often an example someone wrote down
+                    self.unknown.setdefault(spelled, set()).add(path)
+
+        # counting is a second pass: a path first noticed in the last file
+        # scanned is usually named in the first one too
+        for finding in found.values():
+            for path, text in self.texts.items():
+                finding.count(path, text)
+        self.findings = sorted((f for f in found.values() if f.files),
+                               key=lambda f: (not f.clue.sure, f.clue.old))
+
+    # -- reporting --------------------------------------------------------
+
+    def shorten(self, path: str) -> str:
+        return short(path, self.layout.home)
+
+    def relative(self, path: str) -> str:
+        return os.path.relpath(path, self.layout.projects)
+
+    def describe(self) -> None:
+        self.log.info(f"Read {len(self.texts)} memory file(s) in "
+                      f"{len(self.dirs)} project(s)")
+        if self.findings:
+            self.log.info()
+            self.log.info(f"Found {len(self.findings)} path(s) that moved:")
+        for i, finding in enumerate(self.findings, 1):
+            clue = finding.clue
+            self.log.info()
+            self.log.info(f"  {i}. {self.shorten(clue.old)}")
+            self.log.info(f"     -> {self.shorten(clue.new)}"
+                          f"{'' if clue.sure else '   (a guess)'}")
+            self.log.info(f"     {clue.why}")
+            self.log.info(f"     {finding.hits} reference(s) in "
+                          f"{len(finding.files)} memory file(s):")
+            for path in sorted(finding.files):
+                self.log.info(f"       {self.relative(path)}"
+                              f"  ({finding.files[path]})")
+        self.describe_unknown()
+        self.describe_state_dirs()
+
+    def describe_unknown(self) -> None:
+        if not self.unknown:
+            return
+        self.log.info()
+        self.log.info("Named in memory, not on disk, and nowhere obvious to "
+                      "point them:")
+        for spelled in sorted(self.unknown)[:UNKNOWN_SHOWN]:
+            files = sorted(self.unknown[spelled])
+            more = f" and {len(files) - 1} more" if len(files) > 1 else ""
+            self.log.info(f"  {spelled}   ({self.relative(files[0])}{more})")
+        if len(self.unknown) > UNKNOWN_SHOWN:
+            self.log.info(f"  ... and {len(self.unknown) - UNKNOWN_SHOWN} more")
+        self.log.info("  Left alone -- put the directory back, or fix the "
+                      "wording by hand.")
+
+    def describe_state_dirs(self) -> None:
+        """Memory text is all this command rewrites.  When a project's whole
+        state directory is still keyed to the old path, say so and name the
+        command that fixes the rest of it.
+
+        Only for a relocation Claude's own state proves.  Recommending a move
+        on the strength of two directories sharing a name would be advice this
+        command is not entitled to give.
+        """
+        for finding in self.findings:
+            clue = finding.clue
+            if not clue.sure or not os.path.isdir(self.layout.state_dir(clue.old)):
+                continue
+            self.log.info()
+            self.log.info(f"  Note: {self.shorten(clue.old)} still has a whole "
+                          f"state directory of its own.")
+            self.log.info(f"        repair rewrites memory text and nothing "
+                          f"else.  To carry that project's")
+            self.log.info(f"        transcripts, permissions and history "
+                          f"across too, run:")
+            self.log.info(f"          claude-move.py --state-only "
+                          f"{self.shorten(clue.old)} {self.shorten(clue.new)}")
+
+    # -- applying ---------------------------------------------------------
+
+    def choose(self) -> List[Finding]:
+        """Which findings to apply.  Guesses sit in the same list as the
+        certain ones, so the answer has to be able to name a subset."""
+        if self.args.yes:
+            return self.findings
+        count = len(self.findings)
+        prompt = ("\nApply? [a] all, [n] none"
+                  + (f", or numbers like 1,3 (1-{count})" if count > 1 else "")
+                  + " ")
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+        if answer in ("a", "all", "y", "yes"):
+            return self.findings
+        if answer in ("", "n", "no", "none"):
+            return []
+        picked: Dict[int, None] = {}
+        for word in re.split(r"[,\s]+", answer):
+            if word.isdigit() and 1 <= int(word) <= count:
+                picked[int(word) - 1] = None
+            elif word:
+                self.log.warn(f"ignoring {word!r}")
+        return [self.findings[i] for i in sorted(picked)]
+
+    def backup(self, files: List[str]) -> Optional[str]:
+        if self.args.no_backup:
+            return None
+        root = os.path.join(self.layout.dir, BACKUP_DIR,
+                            time.strftime("%Y%m%d-%H%M%S"), "memory")
+        for path in files:
+            dest = os.path.join(root, self.relative(path))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(path, dest)
+        return root
+
+    def apply(self, chosen: List[Finding]) -> None:
+        rules = Rewriter()
+        for finding in chosen:
+            for old, new in finding.pairs:
+                rules.add(old, new)
+        files = sorted({path for finding in chosen for path in finding.files})
+
+        backup = self.backup(files)
+        if backup:
+            self.log.step(f"backed up {len(files)} memory file(s) to {backup}")
+        writes = FileRewriter(rules, self.log)
+        for path in files:
+            writes.text(path)
+        self.log.step(f"{writes.files_rewritten} memory file(s) updated, "
+                      f"{sum(f.hits for f in chosen)} path reference(s) "
+                      f"rewritten")
+        for path in writes.stale:
+            self.log.warn(f"{self.relative(path)} still names an old path "
+                          f"after rewriting")
+
+
+def do_repair(args: argparse.Namespace, layout: Layout, log: Log) -> int:
+    repair = Repair(args, layout, log)
+    if not repair.dirs:
+        log.info("no memory files to check")
+        return 0
+    repair.scan()
+    repair.describe()
+
+    if not repair.findings:
+        log.info()
+        log.info("no memory file names a path that moved -- nothing to fix")
+        return 0
+    if args.dry_run:
+        log.info()
+        log.info("dry run -- nothing was changed")
+        return 0
+
+    chosen = repair.choose()
+    if not chosen:
+        log.info("nothing applied")
+        return 1
+    log.info()
+    repair.apply(chosen)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2067,6 +2521,7 @@ def confirm(prompt: str) -> bool:
 
 
 TRANSFER_COMMANDS = ("export", "inspect", "import")
+SUBCOMMANDS = TRANSFER_COMMANDS + ("repair",)
 
 # the only global flags that swallow the word after them, so the scan below
 # does not mistake a flag's value for a subcommand
@@ -2102,14 +2557,31 @@ def add_part_flags(parser: argparse.ArgumentParser, verb: str) -> None:
                        help="skip the shell-history lines for these projects")
 
 
-def build_transfer_parser() -> argparse.ArgumentParser:
-    """export / inspect / import.  A move rewrites state in place on one
-    machine; these carry the same state to another one."""
+def repeated_globals() -> argparse.ArgumentParser:
+    """The global flags again, for every subcommand to inherit, so they can be
+    written on either side of the subcommand word.  SUPPRESS keeps an unused
+    one from overwriting what was given before the word."""
     shared = argparse.ArgumentParser(add_help=False)
-    for flag, default in (("--claude-dir", None), ("--config", None)):
+    for flag in _VALUE_FLAGS:
         shared.add_argument(flag, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     shared.add_argument("-q", "--quiet", action="store_true",
                         default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    return shared
+
+
+def add_global_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--claude-dir", default=os.path.expanduser("~/.claude"),
+                        help="override the Claude state directory (default ~/.claude)")
+    parser.add_argument("--config", default=os.path.expanduser("~/.claude.json"),
+                        help="override the Claude config file (default ~/.claude.json)")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="only warnings and errors")
+
+
+def build_transfer_parser() -> argparse.ArgumentParser:
+    """export / inspect / import.  A move rewrites state in place on one
+    machine; these carry the same state to another one."""
+    shared = repeated_globals()
 
     parser = argparse.ArgumentParser(
         prog="claude-move",
@@ -2131,12 +2603,7 @@ def build_transfer_parser() -> argparse.ArgumentParser:
 A full bundle holds your session transcripts.  Treat it as private, and
 encrypt it if it leaves your control.
 """)
-    parser.add_argument("--claude-dir", default=os.path.expanduser("~/.claude"),
-                        help="override the Claude state directory (default ~/.claude)")
-    parser.add_argument("--config", default=os.path.expanduser("~/.claude.json"),
-                        help="override the Claude config file (default ~/.claude.json)")
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="only warnings and errors")
+    add_global_flags(parser)
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     exp = sub.add_parser("export", parents=[shared],
@@ -2203,6 +2670,63 @@ def main_transfer(argv: List[str]) -> int:
         return 1
 
 
+def build_repair_parser() -> argparse.ArgumentParser:
+    """repair.  A move keeps state correct as it happens; this cleans up after
+    the moves that happened without it."""
+    parser = argparse.ArgumentParser(
+        prog="claude-move",
+        description="Fix paths inside Claude Code's memory files that name a "
+                    "directory which has since moved.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_global_flags(parser)
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    rep = sub.add_parser(
+        "repair", parents=[repeated_globals()],
+        help="fix stale paths in memory files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Read every memory file, find the paths that no longer "
+                    "exist, work out where they went, and offer to rewrite "
+                    "them.  Nothing is written until you say so.",
+        epilog="""examples:
+  claude-move.py repair                     check every project's memory
+  claude-move.py repair -n                  show what it found, change nothing
+  claude-move.py repair icepick-offsec      one project's memory only
+  claude-move.py repair --no-search         go on evidence alone, no hunting
+
+Memory files are all this touches.  Transcripts, permissions and the state
+directory itself belong to a move, and repair names the command to run when
+it finds one of those is stale too.
+""")
+    rep.add_argument("projects", nargs="*", metavar="PROJECT",
+                     help="project paths, directory names or patterns whose "
+                          "memory to check; omit for every project")
+    rep.add_argument("-n", "--dry-run", action="store_true",
+                     help="report what it found, change nothing")
+    rep.add_argument("-y", "--yes", action="store_true",
+                     help="apply everything found without asking")
+    rep.add_argument("--no-search", action="store_true",
+                     help="do not hunt the home directory for a moved "
+                          "directory by name")
+    rep.add_argument("--no-backup", action="store_true",
+                     help="skip the safety copy of the memory files being changed")
+    return parser
+
+
+def main_repair(argv: List[str]) -> int:
+    args = build_repair_parser().parse_args(argv)
+    log = Log(quiet=args.quiet)
+    layout = Layout(args.claude_dir, args.config)
+    if not os.path.isdir(layout.dir):
+        log.error(f"no Claude state directory at {layout.dir}")
+        return 1
+    try:
+        return do_repair(args, layout, log)
+    except OSError as exc:
+        log.error(str(exc))
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-move",
@@ -2228,6 +2752,10 @@ To carry state to another computer instead of moving it on this one:
   claude-move.py export -o state.tar.gz          pack it up here
   claude-move.py import state.tar.gz             unpack it there, repathed
   claude-move.py inspect state.tar.gz            what a bundle holds
+
+To clean up after a folder that was moved without this tool:
+
+  claude-move.py repair                          stale paths in memory files
 
 Run any of those with --help for their own options.
 """)
@@ -2263,8 +2791,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # move, so `claude-move.py ~/dev/api ~/work` keeps working untouched.  A
     # folder genuinely called "export" is still movable by qualifying it --
     # ./export or an absolute path.
-    if first_word(argv) in TRANSFER_COMMANDS:
+    word = first_word(argv)
+    if word in TRANSFER_COMMANDS:
         return main_transfer(argv)
+    if word == "repair":
+        return main_repair(argv)
 
     parser = build_parser()
     args = parser.parse_args(argv)

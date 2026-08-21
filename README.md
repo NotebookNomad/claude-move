@@ -169,6 +169,49 @@ export. If it is going anywhere you don't control, lock it first:
 gpg -c claude-state.tar.gz            # → claude-state.tar.gz.gpg
 ```
 
+## "I already moved things the hard way"
+
+If folders have been moved around without this tool, Claude's memory files are
+left describing a layout that no longer exists — notes pointing at `~/dev/api`
+when the project has been at `~/work/api` for months.
+
+```bash
+./claude-move.py repair
+```
+
+It reads every memory file, picks out the locations that are no longer there,
+works out where each one went, and shows you the list before touching anything:
+
+```
+Found 1 path(s) that moved:
+
+  1. ~/dev/api
+     -> ~/work/api
+     Claude's own state for that project resolves to it
+     2 reference(s) in 2 memory file(s):
+       ...
+
+Apply? [a] all, [n] none
+```
+
+Answer `a` to take all of it, `n` to take none, or type numbers — `1,3` — to
+take only some. Nothing is written until you answer, and `-n` shows the same
+list and then stops.
+
+Some of what it finds is certain and some is a guess, and it says which is
+which. A location Claude's own records account for is certain. A folder matched
+only by its name — the same name, somewhere else on your disk — is labelled
+**a guess**, because a memory file might simply be quoting an example rather
+than pointing at a real place. Read those before accepting them, or pass
+`--no-search` to leave name-matching out of it entirely.
+
+Locations it cannot place are listed separately and left exactly as written.
+
+> [!NOTE]
+> `repair` fixes the *wording inside memory files*. If a whole project has
+> moved, its conversations and permissions need moving too — the run tells you
+> so, and prints the `--state-only` command that does it.
+
 ## If something goes wrong
 
 **Everything is backed up before it is touched**, into a dated folder at
@@ -237,6 +280,15 @@ everything once and take only part of it on a given machine
 | `--no-globals` | Ignore any `~/.claude`-level files in the bundle |
 | `--no-backup` | Skip the safety copy |
 | `--force` | Proceed despite live sessions or mapping collisions |
+
+**`repair [PROJECT ...]`** — with no projects named, it checks them all
+
+| Flag | Effect |
+| --- | --- |
+| `-n`, `--dry-run` | Show what it found, change nothing |
+| `-y`, `--yes` | Apply everything found, guesses included, without asking |
+| `--no-search` | Don't match a missing folder to one of the same name elsewhere |
+| `--no-backup` | Skip the safety copy |
 
 </details>
 
@@ -383,6 +435,7 @@ edited until you confirm, and everything it touches is backed up first.
 python3 tests/test_claude_move.py            # runs in a temp dir, cleaned up
 python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
 python3 tests/test_export_import.py          # the export/import round trip
+python3 tests/test_repair.py                 # what repair fixes, and what it won't
 ```
 
 The move suite builds a synthetic `~/.claude` mirroring the real layout and
