@@ -1,6 +1,7 @@
 # claude-move
 
-Move or rename a project directory without losing its Claude Code state.
+Move a project without losing its Claude Code state — across your disk, or
+across machines.
 
 Claude Code stores a project's memory, permissions and session history outside
 the project folder, keyed by the project's **absolute path**. Move the folder
@@ -8,7 +9,9 @@ with `mv` and none of it follows: the new location starts with empty memory, no
 permissions, and no past sessions.
 
 `claude-move` performs the move and updates everything that referred to the old
-path.
+path. The same problem shows up when you switch computers, so it also
+[packs that state into a bundle](#another-computer) and unpacks it on the other
+machine, repathed for whatever home directory lives there.
 
 ## Quick start
 
@@ -98,7 +101,120 @@ Files to update are found by scanning `~/.claude` for the old path, so state
 that a future Claude Code version introduces is covered automatically. Projects
 nested inside the folder you are moving are remapped as well.
 
+## Another computer
+
+Moving a project on this machine and carrying it to a different one are the same
+problem: Claude's state is keyed by an absolute path, and the path changes. The
+`export` / `import` pair does the second one.
+
+```bash
+# on the old machine
+./claude-move.py export -o claude-state.tar.gz
+
+# move the file across however you like — AirDrop, scp, a USB stick
+
+# on the new machine, with claude-move.py next to the bundle
+./claude-move.py import claude-state.tar.gz
+```
+
+`/Users/dana/Documents/projects/api` becomes
+`/home/casey/Documents/projects/api` — the home directory is swapped, the layout
+below it is kept, and every reference inside the memory files, transcripts and
+config follows.
+
+Look before you leap:
+
+```bash
+./claude-move.py export --list                  # what would be exported
+./claude-move.py inspect bundle.tar.gz          # what a bundle holds
+./claude-move.py import bundle.tar.gz --dry-run # where each project would land
+```
+
+### What a bundle carries
+
+Everything, by default:
+
+| | |
+|---|---|
+| **memory** | `memory/*.md` and the `MEMORY.md` index |
+| **sessions** | `.jsonl` transcripts, plus each session's subagent and tool-result spill |
+| **file-history** | the blobs behind `/rewind`, renamed to match their new paths |
+| **config** | allowed tools, MCP servers and trust, from `~/.claude.json` |
+| **shell history** | the `history.jsonl` lines belonging to these projects |
+
+Narrow it on either end — the flags are the same on `export` and `import`, so
+you can pack everything once and take only part of it on a given machine:
+
+```bash
+./claude-move.py export --memory-only        # memory and nothing else
+./claude-move.py export --no-sessions        # skip transcripts
+./claude-move.py import bundle.tar.gz --memory-only
+```
+
+`--globals` additionally carries the user-level `~/.claude` files —
+`settings.json`, `CLAUDE.md`, `agents/`, `commands/`, `skills/`. Left out by
+default, because those are usually the new machine's own.
+
+Machine-local telemetry in `~/.claude.json` — `lastCost`, `lastSessionId`,
+`lastVersionBase` and friends — is dropped, since it would be actively
+misleading on the other machine. `--config-all` keeps it anyway.
+
+### Picking projects, and where they land
+
+```bash
+./claude-move.py export                              # every project
+./claude-move.py export icepick-offsec claude-skills # by directory name
+./claude-move.py export '~/dev/*-service'            # or a pattern
+```
+
+By default every project keeps its position relative to your home directory.
+When the new machine is laid out differently:
+
+```bash
+./claude-move.py import bundle.tar.gz --into ~/code
+./claude-move.py import bundle.tar.gz --map api=~/work/api-server
+```
+
+`--map` takes the source path or just its directory name. A project that lived
+outside your home directory has nothing to key the remap off, so its path is
+kept verbatim and the run says so — `--map` it if that is wrong.
+
+### Merging, not clobbering
+
+`import` merges into whatever is already on the machine:
+
+- `MEMORY.md` indexes are **unioned**, line by line.
+- Any other file that already exists and differs is left alone; the incoming
+  copy is written beside it as `*.incoming` and reported. `--overwrite` reverses
+  that.
+- `~/.claude.json` gains the project entries and loses nothing else.
+- Shell-history lines already present are not appended twice.
+- Everything the merge could overwrite is backed up first, in the same
+  `~/.claude/claude-move-backups/` a move uses.
+
+Import is idempotent — running it twice changes nothing the second time.
+
+As with a move, **quit any Claude Code session running in a project being
+imported**; the import checks and refuses rather than letting a live session
+write `~/.claude.json` back over the merge.
+
+### The bundle is private
+
+A full bundle contains your session transcripts — everything Claude read, wrote
+and was told, in every session of every project exported. Treat it like a
+password store; encrypt it if it goes anywhere you do not control.
+
+```bash
+gpg -c claude-state.tar.gz            # → claude-state.tar.gz.gpg
+```
+
+`--memory-only` produces a far smaller and far less sensitive bundle (24K
+against 13M, on the tree this was developed against).
+
 ## Options
+
+These are the move's options; `export` and `import` have their own, listed by
+`./claude-move.py export --help` and `./claude-move.py import --help`.
 
 | Flag | Effect |
 | --- | --- |
@@ -133,6 +249,19 @@ transcripts join, `allowedTools` union, `memory/MEMORY.md` index entries merge,
 and any other conflicting file is kept alongside the original as
 `name.migrated.ext` and reported so you can reconcile it.
 
+### Finding projects at all
+
+A project is discovered from `~/.claude.json`, from the `cwd` recorded inside its
+transcripts, and — failing both — by resolving the state directory's name against
+the filesystem.
+
+That last one matters more than it sounds. The encoding below is lossy, so a
+name cannot be reversed on its own; it *can* be reversed against the directories
+that actually exist. This is the only way to find a project whose folder was
+renamed while its transcripts kept naming the path it moved away from — the case
+that turned up nine memory files during development that every other method
+missed.
+
 ### One caveat: the encoding is lossy
 
 `my_app`, `my app` and `my-app` all encode to `-my-app`, so those projects
@@ -158,11 +287,21 @@ edited until you confirm, and everything it touches is backed up first.
 ```bash
 python3 tests/test_claude_move.py            # runs in a temp dir, cleaned up
 python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
+python3 tests/test_export_import.py          # the export/import round trip
 ```
 
-The suite builds a synthetic `~/.claude` mirroring the real layout and checks
-the full migration, subprojects, merging, wildcards, batch moves, blockers, and
-`--dry-run` being read-only. Your real `~/.claude` is never touched.
+The move suite builds a synthetic `~/.claude` mirroring the real layout and
+checks the full migration, subprojects, merging, wildcards, batch moves,
+blockers, and `--dry-run` being read-only.
+
+The export/import suite runs a full round trip between two fake machines with
+different home directories. Most of its cases assert a **negative** — that a
+project never named on the command line did not come across, that a
+prefix-sharing neighbour (`api-server` beside `api`) kept its own name, that a
+bystander already on the target was untouched, that the source machine was never
+written to. That is where this class of tool actually breaks.
+
+Your real `~/.claude` is never touched by either.
 
 ## License
 
