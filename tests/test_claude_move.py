@@ -575,6 +575,21 @@ def test_list(root):
        "--list reports known projects")
 
 
+def test_list_shows_only_projects_with_state(root):
+    print("== --list and prune agree on what a project is ==")
+    home, old, _, _ = fixture(root, "list-phantom")
+    state = os.path.join(home, ".claude", "projects", enc(old))
+    # a directory the session cd'd into for one command.  Claude Code writes a
+    # cwd on every record, and nothing is filed under this one.
+    with open(os.path.join(state, "aaaa-1111.jsonl"), "a") as fh:
+        fh.write(json.dumps({"type": "user", "sessionId": "aaaa-1111",
+                             "cwd": os.path.join(old, "scratch")}) + "\n")
+    result = run(home, "--list")
+    ok(old in result.stdout, "the project itself is still listed")
+    ok("scratch" not in result.stdout,
+       "a cwd with nothing filed under it is not listed as a project")
+
+
 def test_no_arguments(root):
     print("== the message a bare invocation gets ==")
     home, old, _, _ = fixture(root, "bare")
@@ -587,6 +602,11 @@ def test_no_arguments(root):
        "bare invocation names every command, not just the move")
     ok("SOURCE... DEST" in text and "{export," in text,
        "usage line shows both forms")
+    # USAGE is built from SUBCOMMANDS; the menu below it is written by hand, so
+    # a command added to the tuple would appear in one and not the other
+    listed = re.search(r"\{([a-z,]+)\}", text).group(1).split(",")
+    ok(all(re.search(rf"^\s+{name}\s\s+\S", text, re.M) for name in listed),
+       "every command in the usage line has a row in the menu")
 
     # a source but no destination is not someone browsing; the command menu
     # would bury the one thing they are missing
@@ -608,7 +628,7 @@ def main():
                      test_already_moved, test_destination_is_a_directory,
                      test_multiple_sources, test_wildcards, test_batch_blockers,
                      test_escaped_non_ascii, test_prefix_siblings, test_list,
-                     test_no_arguments):
+                     test_list_shows_only_projects_with_state, test_no_arguments):
             test(root)
     finally:
         if not keep:

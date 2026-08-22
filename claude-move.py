@@ -61,8 +61,8 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
-                    Set, Tuple)
+from typing import (Any, Callable, Container, Dict, Iterable, Iterator, List,
+                    Optional, Set, Tuple)
 
 # Directories under ~/.claude that the path sweep must not touch:
 #   projects/            the moved state dirs are handled explicitly; other
@@ -602,6 +602,34 @@ def known_projects(layout: Layout, log: Optional[Log] = None,
             log.warn(f"state dir {name} holds {len(memory_files(state))} memory "
                      f"file(s) but no matching project directory exists here")
     return found
+
+
+def kept_state(state: str, paths: Iterable[str],
+               entries: Container[str], counts: Container[str]) -> bool:
+    """Whether Claude has actually filed anything under this project.
+
+    `known_projects` promotes every cwd a transcript ever recorded to a
+    project path and maps it to the state directory it *would* have.  Most are
+    not projects: a subdirectory someone cd'd into for one command, one of
+    Claude Code's own worktrees under a project's .claude/, a name a folder
+    wore for an afternoon before being renamed.
+
+    A command that reports or deletes what this machine is keeping must not
+    count those -- there is nothing filed under them to report or delete, and
+    counting them claims more projects than ~/.claude/projects holds.  The
+    move path deliberately keeps them, which is why this narrows at the
+    consumer rather than inside `known_projects`: a session that ran in a
+    subdirectory really does have a scratchpad filed under that
+    subdirectory's encoded name, and a rewrite that skipped it would strand
+    the path it names.
+
+    Blobs need no test of their own: they hang off session ids read out of a
+    state directory, so a project without one has none.  `entries` and
+    `counts` are membership-tested rather than read -- the maps behind them
+    only ever hold a non-empty list and a count of at least one.
+    """
+    return (os.path.isdir(state)
+            or any(path in entries or path in counts for path in paths))
 
 
 def cwds_in_state_dir(state_dir: str) -> Set[str]:
@@ -2784,7 +2812,7 @@ class Prune:
             candidates.setdefault(state, set()).add(path)
 
         for state in sorted(candidates):
-            if not self._kept_anything(state, candidates[state]):
+            if not kept_state(state, candidates[state], self.entries, self.counts):
                 continue
             self.checked += 1
             orphan = self._examine(state, candidates[state])
@@ -2793,26 +2821,6 @@ class Prune:
 
         self._stray_blobs()
         self.orphans.sort(key=lambda o: (-o.size, o.title(self.layout.home)))
-
-    def _kept_anything(self, state: str, known: Set[str]) -> bool:
-        """Whether this is a project Claude actually kept something for.
-
-        `known_projects` promotes every cwd a transcript ever recorded to a
-        project path and maps it to the state directory it *would* have: a
-        subdirectory someone cd'd into for one command, one of Claude Code's
-        own worktrees under a project's .claude/, a folder that wore a
-        different name for an afternoon.  None of them has a state directory,
-        a config entry or a line of history, so there is nothing here to count
-        and nothing to delete -- and counting them says this machine is
-        keeping state for more projects than it is.
-
-        Blobs need no test of their own: they hang off session ids read out of
-        a state directory, so a candidate with none has none.  The ones whose
-        transcript is gone entirely are `_stray_blobs`.
-        """
-        return (os.path.isdir(state)
-                or any(self.entries.get(path) for path in known)
-                or any(self.counts.get(path) for path in known))
 
     def _examine(self, state: str, known: Set[str]) -> Optional[Orphan]:
         """Whether one state directory is genuinely left over, and what of.
@@ -2857,12 +2865,6 @@ class Prune:
             orphan.history += self.counts.get(path, 0)
         orphan.blobs = [self.blob_dirs[sid] for sid in orphan.sessions
                         if sid in self.blob_dirs]
-        if not (orphan.state or orphan.config or orphan.history or orphan.blobs):
-            # Nothing of it is actually here to delete.  A path can be known
-            # only from some other project's transcript -- a cwd a session
-            # once ran in -- and never have had state of its own.  Offering
-            # that is offering to delete nothing.
-            return None
         return orphan
 
     def _alive(self, path: str, state: str) -> bool:
@@ -3197,7 +3199,11 @@ def expand_sources(patterns: Iterable[str], projects: Set[str],
 
 
 def cmd_list(layout: Layout, log: Log) -> int:
-    projects = sorted(known_projects(layout))
+    known = known_projects(layout)
+    entries = {norm(key) for key in config_projects(read_json(layout.config, {}))}
+    counts = {project for _line, project in history_entries(layout) if project}
+    projects = sorted(path for path, state in known.items()
+                      if kept_state(state, (path,), entries, counts))
     if not projects:
         log.info("no Claude Code projects found")
         return 0
