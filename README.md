@@ -188,8 +188,10 @@ Found 1 path(s) that moved:
   1. ~/dev/api
      -> ~/work/api
      Claude's own state for that project resolves to it
-     2 reference(s) in 2 memory file(s):
-       ...
+     1 reference(s) in 1 memory file(s):
+       api/memory/layout.md:12
+         was  The service lives at ~/dev/api and the docs are next to it.
+         now  The service lives at ~/work/api and the docs are next to it.
 
 Apply? [a] all, [n] none
 ```
@@ -197,6 +199,32 @@ Apply? [a] all, [n] none
 Answer `a` to take all of it, `n` to take none, or type numbers — `1,3` — to
 take only some. Nothing is written until you answer, and `-n` shows the same
 list and then stops.
+
+### Every rewrite is quoted before you agree to it
+
+That `was` / `now` pair is the important part. It is there because **a path can
+have genuinely moved and still be wrong to rewrite** — when the sentence is
+recording history rather than pointing somewhere:
+
+```
+       api/memory/history.md:24   reads like history
+         was  ...had been renamed while the notes kept naming `~/dev/api`. Every...
+         now  ...had been renamed while the notes kept naming `~/work/api`. Every...
+```
+
+That second line is nonsense: the sentence exists to say the notes held the
+*old* path. No amount of checking the disk can spot that — only the words
+around the path can. So `repair` looks for phrases like "had been", "formerly",
+"matched from" and "for example" near each mention, marks those **reads like
+history**, and says so again underneath the finding when several of them are:
+
+```
+     4 of 5 references read like history rather than a live path.  Check the
+     wording before applying -- a rewrite may not be what you want here.
+```
+
+It is a hint, not a verdict — read the quoted line and decide. Leaving a
+finding's number out of your answer skips it.
 
 Some of what it finds is certain and some is a guess, and it says which is
 which. A location Claude's own records account for is certain. A folder matched

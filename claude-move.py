@@ -291,6 +291,11 @@ class Rewriter:
             self.hits += 1
         return out
 
+    def preview(self, value: str) -> str:
+        """What `text` would produce, without counting the string as changed --
+        for showing someone a rewrite before they agree to it."""
+        return self._apply(value)[0]
+
     def count(self, value: str) -> int:
         """How many substitutions `text` would make.
 
@@ -2049,6 +2054,64 @@ _SEARCH_LIMIT = 40000
 # how many unfixable paths to print before summarising the rest
 UNKNOWN_SHOWN = 10
 
+# how many rewritten lines to quote per file before summarising the rest
+CONTEXT_SHOWN = 4
+
+# Phrases that suggest a path is being described rather than pointed at.  A
+# memory recording "the folder had been renamed while the transcripts kept
+# naming X" is saying where X used to be; rewriting X to where the folder is
+# now leaves a sentence that describes nothing.  Nothing on the filesystem can
+# tell those two apart -- only the words around the path can, and only well
+# enough to be worth a second look.
+_HISTORY_MARKERS = (
+    "had been", "used to", "formerly", "previously", "originally", "renamed",
+    "moved from", "was at", "old path", "back when", "at the time",
+    "matched from", "copied from", "imported from", "no longer",
+    "for example", "e.g.", "for instance", "such as", "say,",
+)
+
+
+def reads_like_history(before: str, after: str) -> bool:
+    """Whether the words around a mention suggest it is quoting a path rather
+    than pointing at one."""
+    window = " ".join((before[-160:], after[:40])).lower()
+    return (any(marker in window for marker in _HISTORY_MARKERS)
+            or after.lstrip().startswith(")")
+            or before.rstrip().endswith("("))
+
+
+def changed_span(old: str, new: str) -> Tuple[int, int]:
+    """Where two versions of one line stop and start agreeing."""
+    limit = min(len(old), len(new))
+    start = 0
+    while start < limit and old[start] == new[start]:
+        start += 1
+    tail = 0
+    while tail < limit - start and old[-1 - tail] == new[-1 - tail]:
+        tail += 1
+    return start, len(old) - tail
+
+
+def excerpt(lead: str, line: str, at: int, ends: int, width: int) -> str:
+    """A slice of prose showing a change and the words around it.
+
+    The line before is folded in because memory files are wrapped prose: a path
+    often lands at the start of its own line, with the words that give it its
+    meaning -- "kept naming", "matched from" -- on the line above.  The window
+    slides right far enough to show the end of the change, because a rewrite
+    the reader cannot see the end of is one they cannot judge.
+    """
+    joined = f"{lead} {line}" if lead else line
+    offset = len(lead) + 1 if lead else 0
+    at, ends = at + offset, ends + offset
+    # a few characters past the change, so the closing quote or bracket after
+    # a path is visible and a trailing "..." reads as "the sentence goes on"
+    # rather than "the path was cut off"
+    start = max(0, min(at - width // 3, ends + 16 - width))
+    piece = joined[start:start + width]
+    return ("..." if start else "") + piece.strip() + \
+           ("..." if start + width < len(joined) else "")
+
 
 def mentioned_paths(text: str, home: str) -> Dict[str, str]:
     """Absolute path -> the spelling it was written in, for every path the
@@ -2286,6 +2349,14 @@ class Repair:
         self.texts: Dict[str, str] = {}
         self.findings: List[Finding] = []
         self.unknown: Dict[str, Set[str]] = {}
+        # state directory -> the project it holds, for naming files readably.
+        # An existing folder wins: after a move both the old and new path can
+        # still resolve onto one directory, and the old one is not what to
+        # call it.
+        self.owners: Dict[str, str] = {}
+        for project, state in sorted(self.relocations.projects.items()):
+            if state not in self.owners or os.path.isdir(project):
+                self.owners[state] = project
 
     def _targets(self) -> List[str]:
         """State directories to read.  Naming projects narrows it; naming none
@@ -2343,6 +2414,22 @@ class Repair:
     def relative(self, path: str) -> str:
         return os.path.relpath(path, self.layout.projects)
 
+    def label(self, path: str) -> str:
+        """A memory file named the way its owner thinks of it.
+
+        The encoded state directory name is unreadable at a glance and every
+        one of them shares a long prefix, which is the worst possible shape for
+        a list someone has to scan.  The project's own folder name is what they
+        recognise; the encoded name stays as the fallback when no project
+        resolves onto that directory.
+        """
+        state = os.path.dirname(path)
+        if os.path.basename(state) == "memory":
+            state = os.path.dirname(state)
+        owner = self.owners.get(state)
+        rest = os.path.relpath(path, state)
+        return f"{os.path.basename(owner)}/{rest}" if owner else self.relative(path)
+
     def describe(self) -> None:
         self.log.info(f"Read {len(self.texts)} memory file(s) in "
                       f"{len(self.dirs)} project(s)")
@@ -2358,10 +2445,47 @@ class Repair:
             self.log.info(f"     {clue.why}")
             self.log.info(f"     {finding.hits} reference(s) in "
                           f"{len(finding.files)} memory file(s):")
-            for path in sorted(finding.files):
-                self.log.info(f"       {self.relative(path)}"
-                              f"  ({finding.files[path]})")
+            quoted = self.describe_references(finding)
+            if any(quoted):
+                seen = (f"Every reference to this reads" if all(quoted)
+                        else f"{sum(quoted)} of {len(quoted)} references read")
+                self.log.info(f"     {seen} like history rather than a live "
+                              f"path.  Check the")
+                self.log.info(f"     wording before applying -- a rewrite may "
+                              f"not be what you want here.")
         self.describe_unknown()
+
+    def describe_references(self, finding: "Finding") -> List[bool]:
+        """Quote each line this finding would rewrite, before and after.
+
+        The path evidence can prove a directory moved.  It cannot tell whether
+        a sentence is pointing at that path or quoting it, and the only thing
+        that can is the sentence itself -- so put it in front of the person
+        being asked to approve the rewrite.
+        """
+        width = max(60, min(shutil.get_terminal_size((100, 24)).columns - 14, 150))
+        history: List[bool] = []
+        for path in sorted(finding.files):
+            text = self.texts[path]
+            before, after = text.splitlines(), finding.rules.preview(text).splitlines()
+            changed = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
+            for i in changed[:CONTEXT_SHOWN]:
+                start, end = changed_span(before[i], after[i])
+                lead = " ".join(before[max(0, i - 1):i])
+                quoting = reads_like_history(lead + " " + before[i][:start],
+                                             before[i][end:])
+                history.append(quoting)
+                self.log.info(f"       {self.label(path)}:{i + 1}"
+                              f"{'   reads like history' if quoting else ''}")
+                _, grew = changed_span(after[i], before[i])
+                self.log.info(f"         was  "
+                              f"{excerpt(lead, before[i], start, end, width)}")
+                self.log.info(f"         now  "
+                              f"{excerpt(lead, after[i], start, grew, width)}")
+            if len(changed) > CONTEXT_SHOWN:
+                self.log.info(f"       ... and {len(changed) - CONTEXT_SHOWN} "
+                              f"more line(s) in the same file")
+        return history
         self.describe_state_dirs()
         self.describe_live()
 
@@ -2389,7 +2513,7 @@ class Repair:
         for spelled in sorted(self.unknown)[:UNKNOWN_SHOWN]:
             files = sorted(self.unknown[spelled])
             more = f" and {len(files) - 1} more" if len(files) > 1 else ""
-            self.log.info(f"  {spelled}   ({self.relative(files[0])}{more})")
+            self.log.info(f"  {spelled}   ({self.label(files[0])}{more})")
         if len(self.unknown) > UNKNOWN_SHOWN:
             self.log.info(f"  ... and {len(self.unknown) - UNKNOWN_SHOWN} more")
         self.log.info("  Left alone -- put the directory back, or fix the "
@@ -2470,7 +2594,7 @@ class Repair:
                       f"{sum(f.hits for f in chosen)} path reference(s) "
                       f"rewritten")
         for path in writes.stale:
-            self.log.warn(f"{self.relative(path)} still names an old path "
+            self.log.warn(f"{self.label(path)} still names an old path "
                           f"after rewriting")
 
 

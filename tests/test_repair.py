@@ -241,6 +241,89 @@ class RepairTest(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertEqual(self.m.read_memory(new, "notes.md"), f"at {old}\n")
 
+    # -- helping the reader spot a false positive -------------------------
+
+    def moved_project(self):
+        """A project whose old path is proven, ready for a memory to name."""
+        new = self.make_dir("work/api")
+        old = self.path("dev/api")
+        self.m.sessions_naming(self.m.state(new), old)
+        return new, old
+
+    def test_each_rewrite_is_quoted_before_and_after(self):
+        new, old = self.moved_project()
+        self.m.memory(new, "notes.md", f"The service lives at {old} today.\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("was  ", out)
+        self.assertIn("now  ", out)
+        # the temp paths are long enough that the window trims the left, so
+        # assert on the tail that identifies which path is which
+        self.assertIn("/dev/api today.", out)
+        self.assertIn("/work/api today.", out)
+
+    def test_a_mention_that_reads_like_history_is_flagged(self):
+        new, old = self.moved_project()
+        self.m.memory(new, "notes.md",
+                      f"The folder had been renamed while the transcripts kept "
+                      f"naming {old}.\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("reads like history", out)
+        self.assertIn("Every reference to this reads like history", out)
+
+    def test_a_marker_on_the_previous_line_still_counts(self):
+        """Memory files are wrapped prose: the path often lands on its own
+        line, with the words that give it meaning on the line above."""
+        new, old = self.moved_project()
+        self.m.memory(new, "notes.md",
+                      f"The folder had been renamed while the transcripts\n"
+                      f"kept naming {old}. Every other method missed it.\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("reads like history", out)
+
+    def test_a_live_pointer_is_not_flagged(self):
+        new, old = self.moved_project()
+        self.m.memory(new, "notes.md", f"Run the build from {old}/scripts.\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("reads like history", out)
+
+    def test_a_mixed_finding_counts_the_historical_ones(self):
+        new, old = self.moved_project()
+        self.m.memory(new, "live.md", f"Run the build from {old}/scripts.\n")
+        self.m.memory(new, "past.md", f"It had been at {old} before.\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 of 2 references read like history", out)
+
+    def test_files_are_named_by_their_project_not_the_encoding(self):
+        new, old = self.moved_project()
+        self.m.memory(new, "notes.md", f"at {old}\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("api/memory/notes.md:1", out)
+        self.assertNotIn(f"{encode(new)}/memory/notes.md", out)
+
+    def test_a_change_near_the_start_of_a_line_is_quoted_whole(self):
+        """The window would slide off the left edge here.  A short line needs
+        no trimming at all, and must come through intact."""
+        self.moved_project()
+        new = self.path("work/api")
+        self.m.memory(new, "notes.md", "~/dev/api is where it was.\n")
+
+        code, out = self.m.repair("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("was  ~/dev/api is where it was.", out)
+        self.assertIn("now  ~/work/api is where it was.", out)
+
     # -- the guesses ------------------------------------------------------
 
     def test_a_project_of_the_same_name_is_offered_as_a_guess(self):
