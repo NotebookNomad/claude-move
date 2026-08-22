@@ -43,6 +43,14 @@ class Fixture(Machine):
         write(self.config, json.dumps(cfg, indent=2))
         return project
 
+    def record_cwd(self, project, session, cwd):
+        """Another directory the same session ran in.  Claude Code writes a
+        cwd on every record, and `known_projects` reads all of them."""
+        with open(os.path.join(self.state(project), session + ".jsonl"), "a") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": cwd,
+                                 "sessionId": session}) + "\n")
+        return cwd
+
     def blobs_for(self, session, *files):
         """A file-history folder for one session id."""
         for name in files:
@@ -247,6 +255,50 @@ class PruneTest(unittest.TestCase):
         # and the bare path is not a second item of its own
         self.assertIn("1 item(s)", out)
         self.assertNotIn("2. ", out)
+
+    # -- what it counts ---------------------------------------------------
+
+    def test_a_subdirectory_a_session_ran_in_is_not_its_own_project(self):
+        """A cwd is not a project.  Counting one says this machine is keeping
+        state for more projects than it is, and the reader checks that number
+        against ~/.claude/projects."""
+        api = self.m.alive("dev/api", session="s-1")
+        self.m.record_cwd(api, "s-1", self.make_dir("dev/api/workspace"))
+        code, out = self.m.prune("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Checked 1 project(s)", out)
+        self.assertNotIn("workspace", out)
+
+    def test_a_worktree_under_a_project_is_not_its_own_project(self):
+        api = self.m.alive("dev/api", session="s-1")
+        # gone, as Claude Code's own worktrees are once the branch is done
+        self.m.record_cwd(api, "s-1", self.path("dev/api/.claude/worktrees/wt"))
+        code, out = self.m.prune("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Checked 1 project(s)", out)
+        self.assertNotIn("worktrees", out)
+
+    def test_a_name_a_folder_wore_briefly_is_not_counted_or_chased(self):
+        """The cwd of a folder that has since been renamed, with no state
+        directory, no config entry and no history of its own.  There is
+        nothing to carry across, so offering to move it sends the reader after
+        a command that would move nothing."""
+        api = self.m.alive("projects/api", session="s-1")
+        self.m.record_cwd(api, "s-1", self.path("api-under-its-old-name"))
+        code, out = self.m.prune("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Checked 1 project(s)", out)
+        self.assertNotIn("api-under-its-old-name", out)
+
+    def test_state_with_nothing_on_disk_behind_it_is_still_counted(self):
+        """The other side of the same rule: a config entry alone, or a state
+        directory alone, is a project this command is responsible for."""
+        self.m.alive("dev/api", session="s-1")
+        self.m.config_only("dev/gone-a")
+        self.m.gone("dev/gone-b", session="s-2")
+        code, out = self.m.prune("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Checked 3 project(s)", out)
 
     def test_naming_one_project_never_reaches_another(self):
         """A cwd recorded inside a transcript can name a different project.

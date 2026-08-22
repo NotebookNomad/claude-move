@@ -2784,6 +2784,8 @@ class Prune:
             candidates.setdefault(state, set()).add(path)
 
         for state in sorted(candidates):
+            if not self._kept_anything(state, candidates[state]):
+                continue
             self.checked += 1
             orphan = self._examine(state, candidates[state])
             if orphan:
@@ -2791,6 +2793,26 @@ class Prune:
 
         self._stray_blobs()
         self.orphans.sort(key=lambda o: (-o.size, o.title(self.layout.home)))
+
+    def _kept_anything(self, state: str, known: Set[str]) -> bool:
+        """Whether this is a project Claude actually kept something for.
+
+        `known_projects` promotes every cwd a transcript ever recorded to a
+        project path and maps it to the state directory it *would* have: a
+        subdirectory someone cd'd into for one command, one of Claude Code's
+        own worktrees under a project's .claude/, a folder that wore a
+        different name for an afternoon.  None of them has a state directory,
+        a config entry or a line of history, so there is nothing here to count
+        and nothing to delete -- and counting them says this machine is
+        keeping state for more projects than it is.
+
+        Blobs need no test of their own: they hang off session ids read out of
+        a state directory, so a candidate with none has none.  The ones whose
+        transcript is gone entirely are `_stray_blobs`.
+        """
+        return (os.path.isdir(state)
+                or any(self.entries.get(path) for path in known)
+                or any(self.counts.get(path) for path in known))
 
     def _examine(self, state: str, known: Set[str]) -> Optional[Orphan]:
         """Whether one state directory is genuinely left over, and what of.
