@@ -3529,7 +3529,8 @@ Run any of those with --help for their own options.
 """)
     parser.add_argument("paths", nargs="*", metavar="PATH",
                         help="one or more project paths, then the destination")
-    parser.add_argument("--list", action="store_true", help="list known projects and exit")
+    parser.add_argument("--list", action="store_true",
+                        help="list the projects Claude has state for, and exit")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="print the plan without touching anything")
     parser.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
@@ -3581,7 +3582,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                       f"{args.paths[0]} go?")
         else:
             log.error(
-                "no arguments.  moving a folder is one of several commands:\n"
+                "no project paths given.  moving a folder is one of "
+                "several commands:\n"
                 "       --list     every project Claude has state for\n"
                 "       prune      delete what folders that are gone left behind\n"
                 "       repair     fix stale paths after a move done by hand\n"

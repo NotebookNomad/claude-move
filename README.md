@@ -25,7 +25,7 @@ sign up for, and no dependencies. The whole tool is a single file.
 git clone https://github.com/NotebookNomad/claude-move.git
 cd claude-move
 
-./claude-move.py --list        # show every project Claude knows about
+./claude-move.py --list        # show every project Claude has state for
 ```
 
 If you don't have `git`, download `claude-move.py` from the project page
@@ -356,7 +356,7 @@ Everything below is reference material. You don't need it to use the tool.
 | `--no-project-settings` | Don't rewrite paths in the project's own `.claude/` files |
 | `--no-backup` | Skip the safety copy |
 | `--force` | Proceed despite non-fatal blockers, such as a live session |
-| `--list` | List known projects and exit |
+| `--list` | List the projects Claude has state for, and exit |
 
 **Choosing what to carry** — the same on `export` and `import`, so you can pack
 everything once and take only part of it on a given machine

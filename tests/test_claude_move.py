@@ -586,7 +586,9 @@ def test_list_shows_only_projects_with_state(root):
                              "cwd": os.path.join(old, "scratch")}) + "\n")
     result = run(home, "--list")
     ok(old in result.stdout, "the project itself is still listed")
-    ok("scratch" not in result.stdout,
+    # the whole path, not the last segment: the suite takes a fixture root on
+    # the command line, and one containing this word would match anywhere
+    ok(os.path.join(old, "scratch") not in result.stdout,
        "a cwd with nothing filed under it is not listed as a project")
 
 
@@ -594,9 +596,16 @@ def test_no_arguments(root):
     print("== the message a bare invocation gets ==")
     home, old, _, _ = fixture(root, "bare")
 
+    bare = subprocess.run([sys.executable, SCRIPT], capture_output=True, text=True)
     result = run(home)
     text = result.stdout + result.stderr
-    ok(result.returncode == 2, "bare invocation exits 2")
+    ok(result.returncode == 2, "flags but no paths exits 2")
+    ok(bare.returncode == 2 and "prune" in bare.stdout + bare.stderr,
+       "a truly bare invocation gets the menu too")
+    # it fires whenever no positional path was given, so it must not claim the
+    # command line was empty when flags were on it
+    ok("no arguments" not in text,
+       "flags with no paths are not called no arguments")
     ok(all(word in text for word in ("prune", "repair", "export", "import",
                                      "inspect", "--list")),
        "bare invocation names every command, not just the move")
