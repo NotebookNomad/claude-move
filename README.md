@@ -259,7 +259,7 @@ folder is gone, and offers them to you:
 ```
 Gone from disk, with nothing on this machine to say where they went:
 
-  1. ~/dev/scratch-api   3.2M
+  1. ~/dev/scratch-api   3M
      14 transcript(s), 2 memory file(s), permissions and settings, 6 shell-history line(s)
      last written 2026-03-04
 

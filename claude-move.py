@@ -1314,6 +1314,18 @@ PORTABLE_CONFIG_KEYS = (
 )
 
 
+def config_projects(config: Any) -> Dict[str, Any]:
+    """The projects map inside a parsed ~/.claude.json.
+
+    Returns the live inner dict, so a caller removing a key from it and
+    writing `config` back works -- and an empty one when the file parses to
+    anything not shaped like a config, which must not raise halfway through
+    a run that has already deleted something.
+    """
+    entries = config.get("projects") if isinstance(config, dict) else None
+    return entries if isinstance(entries, dict) else {}
+
+
 def read_json(path: str, default: Any = None) -> Any:
     blob = read_text(path)
     if blob is None:
@@ -2717,7 +2729,8 @@ class Orphan:
         if self.state:
             bits.append(f"{len(self.sessions)} transcript(s)")
             bits.append(f"{self.memory} memory file(s)")
-        if self.blobs and self.paths:
+        if self.blobs and (self.state or self.paths):
+            # the stray group is nothing but blobs, and its title says so
             bits.append(f"{len(self.blobs)} file-history folder(s)")
         if self.config:
             bits.append("permissions and settings")
@@ -2747,9 +2760,8 @@ class Prune:
         self.checked = 0
         # the config keyed as it is actually written, so an entry is removed by
         # the key it has rather than by the normalised form we compare on
-        entries = (read_json(layout.config, {}) or {}).get("projects")
         self.entries: Dict[str, List[str]] = {}
-        for key in (entries if isinstance(entries, dict) else {}):
+        for key in config_projects(read_json(layout.config, {})):
             self.entries.setdefault(norm(key), []).append(key)
         # session id -> its folder of /rewind blobs.  Every state directory
         # asks this the same question, and the answer does not change between
@@ -2781,11 +2793,21 @@ class Prune:
         self.orphans.sort(key=lambda o: (-o.size, o.title(self.layout.home)))
 
     def _examine(self, state: str, known: Set[str]) -> Optional[Orphan]:
-        """Whether one state directory is genuinely left over, and what of."""
-        claims = known | self.relocations.claims(state)
-        if not self._wanted(claims):
+        """Whether one state directory is genuinely left over, and what of.
+
+        Two questions, deliberately asked of two different sets of paths.
+        Whether anything still uses this directory takes every path recorded
+        anywhere inside it, including a cwd some session merely ran in.  What
+        the directory *is* -- what to call it, whose settings and whose shell
+        history go with it -- takes only the paths it belongs to.  A cwd
+        recorded here can belong to another project entirely, and attributing
+        that project's settings to this one deletes them out from under it.
+        """
+        mentioned = known | self.relocations.claims(state)
+        owners = sorted(known)
+        if not self._wanted(owners):
             return None
-        if any(os.path.isdir(path) for path in claims):
+        if any(self._alive(path, state) for path in mentioned):
             return None                     # the project is still right there
 
         # The folder may have been renamed together with its state directory,
@@ -2794,19 +2816,11 @@ class Prune:
         if any(os.path.isdir(c) for c in decode_state_dir(os.path.basename(state))):
             return None
 
-        # A cwd inside ~/.claude is Claude's own scratch space rather than a
-        # project.  It still names this directory better than the encoded form
-        # does, so keep it -- but behind any real project path, which is what
-        # the user recognises and what a move would have to name.
-        owned = sorted(p for p in claims if not is_under(p, self.layout.dir))
-        scratch = sorted(p for p in claims if is_under(p, self.layout.dir))
-        # Of several claims the one this directory is *named* for is its
-        # owner; the rest are places a session happened to run and got its
-        # cwd recorded.  Naming it after whichever sorted first would put a
-        # passing visitor's name on the whole thing.
-        owned.sort(key=lambda p: encode_path(p) != os.path.basename(state))
-
-        for path in owned + scratch:
+        # Several owners means the lossy encoding collapsed them onto one
+        # directory ("my_app" and "my-app"), so they all encode to its name
+        # and none of them is the one it is "really" called after.  The first
+        # alphabetically names it; the rest are listed under it.
+        for path in owners or sorted(mentioned):
             clue = self.relocations.resolve(path)
             if clue:
                 # the clue may be about an ancestor that moved; say where this
@@ -2815,7 +2829,7 @@ class Prune:
                                        clue.why, clue.sure))
                 return None
 
-        orphan = Orphan(owned + scratch, state if os.path.isdir(state) else None)
+        orphan = Orphan(owners, state if os.path.isdir(state) else None)
         for path in orphan.paths:
             orphan.config.extend(self.entries.get(path, []))
             orphan.history += self.counts.get(path, 0)
@@ -2828,6 +2842,22 @@ class Prune:
             # that is offering to delete nothing.
             return None
         return orphan
+
+    def _alive(self, path: str, state: str) -> bool:
+        """Whether one recorded path being on disk keeps this directory in use.
+
+        Claude's own space under ~/.claude is the exception that matters.  A
+        subagent can run with its cwd inside a state directory -- editing the
+        memory files that live in *this very directory* -- and such a path
+        exists for exactly as long as the directory does, so reading it as
+        proof of life would make the thing immortal.  It counts only when the
+        directory is named for it, which is what one of Claude Code's own
+        worktrees looks like.
+        """
+        if (is_under(path, self.layout.dir)
+                and encode_path(path) != os.path.basename(state)):
+            return False
+        return os.path.isdir(path)
 
     def _stray_blobs(self) -> None:
         """/rewind blobs whose transcript is gone.
@@ -2845,6 +2875,17 @@ class Prune:
             group = Orphan([])
             group.blobs = stray
             self.orphans.append(group)
+
+    def unmatched(self) -> List[str]:
+        """Patterns that name nothing Claude has ever heard of.
+
+        Distinct from a pattern that matched a project which turned out to
+        have nothing left over -- that one is a clean bill of health, and
+        saying otherwise would train people to ignore the difference.
+        """
+        return [p for p in self.args.projects
+                if not any(matches_pattern(path, p)
+                           for path in self.relocations.projects)]
 
     def _wanted(self, claims: Iterable[str]) -> bool:
         """Whether the command line asked about this one.  Applied before the
@@ -2935,9 +2976,7 @@ class Prune:
     def doomed_entries(self, chosen: List[Orphan], config: Any) -> Dict[str, Any]:
         """The ~/.claude.json project entries the chosen orphans own, under the
         keys they are written with."""
-        entries = config.get("projects") if isinstance(config, dict) else None
-        if not isinstance(entries, dict):
-            return {}
+        entries = config_projects(config)
         keys = {key for o in chosen for key in o.config}
         return {k: v for k, v in entries.items() if k in keys}
 
@@ -3018,9 +3057,7 @@ class Prune:
         # re-read rather than trust the scan: a session may have rewritten the
         # file since, and a key no longer in it is already forgotten
         config = read_json(self.layout.config, {}) or {}
-        entries = config.get("projects")
-        if not isinstance(entries, dict):
-            return 0
+        entries = config_projects(config)
         gone = [k for k in keys if k in entries]
         for key in gone:
             del entries[key]
@@ -3042,13 +3079,25 @@ class Prune:
 
 def do_prune(args: argparse.Namespace, layout: Layout, log: Log) -> int:
     prune = Prune(args, layout, log)
+
+    # A pattern naming nothing Claude knows about is a typo, and this command
+    # deletes: stop on it rather than quietly pruning whatever the other
+    # patterns did match.  Reporting every bad name at once beats making the
+    # user fix them one run at a time.
+    missing = prune.unmatched()
+    if missing:
+        for pattern in missing:
+            log.error(f"no project matches {pattern!r}")
+        log.error("nothing was deleted -- fix the names above")
+        return 2
+
     prune.scan()
     prune.describe()
 
     if not prune.orphans:
         log.info()
-        # naming projects that match nothing is a mistyped argument, not a
-        # clean bill of health, and must not read as one
+        # every name given did match a project; they simply have nothing left
+        # over, which is a clean bill of health and reports as one
         log.info("nothing left over for the projects named" if args.projects
                  else "nothing to prune -- every project Claude has state for "
                       "is still on disk")

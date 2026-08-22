@@ -248,6 +248,93 @@ class PruneTest(unittest.TestCase):
         self.assertIn("1 item(s)", out)
         self.assertNotIn("2. ", out)
 
+    def test_naming_one_project_never_reaches_another(self):
+        """A cwd recorded inside a transcript can name a different project.
+
+        Filtering on those rather than on what the directory belongs to meant
+        naming a path with nothing of its own deleted the state of the project
+        whose transcript merely mentioned it.
+        """
+        gone = self.m.gone("dev/vanished", session="s1")
+        ghost = self.path("dev/ghost")
+        write(os.path.join(self.m.state(gone), "s1.jsonl"),
+              json.dumps({"type": "user", "cwd": gone, "sessionId": "s1"}) + "\n"
+              + json.dumps({"type": "user", "cwd": ghost, "sessionId": "s1"}) + "\n")
+
+        code, out = self.m.prune("ghost", "-y", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isdir(self.m.state(gone)), out)
+        self.assertIn(gone, self.m.config_projects(), out)
+
+    def test_declining_an_orphan_keeps_all_of_it(self):
+        """Picking item 1 must not take item 2's settings and history with it.
+
+        Each orphan owns only what its own directory does; a cwd recorded in
+        someone else's transcript brings none of its owner's belongings along.
+        """
+        big = self.m.gone("dev/vanished", session="s1",
+                          memory={"n.md": "x" * 4000})
+        small = self.m.gone("dev/ghost", session="s2")
+        self.m.add_history(small, "ghost command")
+        # the big project's transcript also records the small one as a cwd
+        write(os.path.join(self.m.state(big), "s1.jsonl"),
+              json.dumps({"type": "user", "cwd": big, "sessionId": "s1"}) + "\n"
+              + json.dumps({"type": "user", "cwd": small, "sessionId": "s1"}) + "\n")
+
+        code, out = self.m.prune("--no-search", answer="1")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.m.state(big)), out)
+        # the one that was declined keeps every part of itself
+        self.assertTrue(os.path.isdir(self.m.state(small)), out)
+        self.assertIn(small, self.m.config_projects(), out)
+        self.assertIn("ghost command",
+                      read(os.path.join(self.m.claude, "history.jsonl")), out)
+
+    def test_a_subagent_cwd_inside_the_state_dir_does_not_keep_it_alive(self):
+        """A session editing memory runs with its cwd inside the state
+        directory itself.  That path lives exactly as long as the directory
+        does, so counting it as proof of life made the thing unprunable."""
+        gone = self.m.gone("dev/vanished", session="s1")
+        state = self.m.state(gone)
+        write(os.path.join(state, "s1.jsonl"),
+              json.dumps({"type": "user", "cwd": gone, "sessionId": "s1"}) + "\n"
+              + json.dumps({"type": "user", "cwd": os.path.join(state, "memory"),
+                            "sessionId": "s1"}) + "\n")
+
+        code, out = self.m.prune("-y", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(state), out)
+
+    def test_an_unnamed_orphan_still_lists_its_blobs(self):
+        """A state directory nothing resolves onto is named by its encoded
+        form, and its inventory must still say what goes with it -- an item
+        whose listing understates itself is being approved blind."""
+        state = os.path.join(self.m.claude, "projects",
+                             encode(self.path("work/never-existed")))
+        write(os.path.join(state, "s9.jsonl"),
+              json.dumps({"type": "user", "cwd": self.path("dev/long-gone"),
+                          "sessionId": "s9"}) + "\n")
+        blobs = self.m.blobs_for("s9", "/a.py")
+
+        code, out = self.m.prune("-n", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 file-history folder(s)", out)
+        self.assertTrue(os.path.isdir(blobs), out)
+
+    def test_a_config_that_is_not_an_object_does_not_crash_the_run(self):
+        """~/.claude.json parsing to something other than an object must not
+        raise -- least of all part-way through, once the state directories
+        have already been moved into the backup."""
+        gone = self.m.gone("dev/vanished", session="s1")
+        write(self.m.config, json.dumps(["not", "a", "config"]))
+
+        code, out = self.m.prune("-y", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.m.state(gone)), out)
+        # and the file it could not read is left exactly as it was
+        self.assertEqual(["not", "a", "config"],
+                         json.loads(read(self.m.config)))
+
     def test_an_unparseable_history_line_survives_the_rewrite(self):
         gone = self.m.gone("dev/vanished", session="s1")
         self.m.add_history(gone, "make test")
@@ -309,12 +396,23 @@ class PruneTest(unittest.TestCase):
         # blobs belong to no named project, so naming one leaves them
         self.assertTrue(os.path.isdir(stray), out)
 
-    def test_naming_nothing_that_matches_is_not_a_clean_bill_of_health(self):
+    def test_a_mistyped_name_stops_the_run(self):
+        """This command deletes, so a name it cannot place is a reason to stop
+        rather than to go ahead with whatever the other names matched."""
         gone = self.m.gone("dev/vanished", session="s1")
-        code, out = self.m.prune("typo", "-y", "--no-search")
-        self.assertEqual(code, 0, out)
-        self.assertIn("for the projects named", out)
+        code, out = self.m.prune("vanished", "typo", "-y", "--no-search")
+        self.assertEqual(code, 2, out)
+        self.assertIn("no project matches 'typo'", out)
         self.assertTrue(os.path.isdir(self.m.state(gone)), out)
+
+    def test_naming_a_live_project_is_a_clean_bill_of_health(self):
+        """A name that matched a project which simply has nothing left over is
+        not the same as a name that matched nothing at all."""
+        alive = self.m.alive("dev/api", session="s1")
+        code, out = self.m.prune("api", "-y", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertIn("nothing left over", out)
+        self.assertTrue(os.path.isdir(self.m.state(alive)), out)
 
     # -- the safety copy --------------------------------------------------
 
