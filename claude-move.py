@@ -3258,6 +3258,13 @@ def pick(items: List[Any], verb: str, log: Log,
 # still movable by qualifying it -- ./export, or an absolute path.
 SUBCOMMANDS = ("export", "inspect", "import", "repair", "prune")
 
+# argparse would otherwise spell out every move flag here and no command at
+# all, which is the one thing the reader cannot guess.  Built from the tuple
+# above so a command added there shows up without a second edit.
+USAGE = ("claude-move [options] SOURCE... DEST\n"
+         "       claude-move --list\n"
+         "       claude-move {" + ",".join(SUBCOMMANDS) + "} [options]")
+
 # the only global flags that swallow the word after them, so the scan below
 # does not mistake a flag's value for a subcommand
 _VALUE_FLAGS = ("--claude-dir", "--config")
@@ -3480,6 +3487,7 @@ def main_subcommand(argv: List[str]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-move",
+        usage=USAGE,
         description="Move or rename a project directory and carry its Claude Code "
                     "state (transcripts, memory, permissions, history) with it.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3556,9 +3564,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list:
         return cmd_list(layout, log)
     if len(args.paths) < 2:
+        # Bare, this is the first thing a reader sees, and a move is only one
+        # of the things here -- someone who came to clean up after a folder
+        # that is already gone would otherwise have to guess that prune
+        # exists.  Given a source but no destination they know what they came
+        # for, so answer the question they actually asked instead.
         parser.print_usage(sys.stderr)
-        log.error("at least one source and a destination path are required "
-                  "(or use --list)")
+        if args.paths:
+            log.error(f"a destination path is required: where should "
+                      f"{args.paths[0]} go?")
+        else:
+            log.error(
+                "no arguments.  moving a folder is one of several commands:\n"
+                "       --list     every project Claude has state for\n"
+                "       prune      delete what folders that are gone left behind\n"
+                "       repair     fix stale paths after a move done by hand\n"
+                "       export     pack state up to carry to another computer\n"
+                "       import     unpack a bundle here, repathed for it\n"
+                "       inspect    show what a bundle holds\n"
+                "       --help, or COMMAND --help, for what each one takes")
         return 2
     if not os.path.isdir(layout.dir):
         log.error(f"no Claude state directory at {layout.dir}")

@@ -575,6 +575,31 @@ def test_list(root):
        "--list reports known projects")
 
 
+def test_no_arguments(root):
+    print("== the message a bare invocation gets ==")
+    home, old, _, _ = fixture(root, "bare")
+
+    result = run(home)
+    text = result.stdout + result.stderr
+    ok(result.returncode == 2, "bare invocation exits 2")
+    ok(all(word in text for word in ("prune", "repair", "export", "import",
+                                     "inspect", "--list")),
+       "bare invocation names every command, not just the move")
+    ok("SOURCE... DEST" in text and "{export," in text,
+       "usage line shows both forms")
+
+    # a source but no destination is not someone browsing; the command menu
+    # would bury the one thing they are missing
+    result = run(home, old)
+    text = result.stdout + result.stderr
+    ok(result.returncode == 2 and "destination" in text and old in text,
+       "a lone source asks for the destination, and names what it is for")
+    # "prune" alone would match the usage line, which names every command
+    # whatever the error is
+    ok("every project Claude has state for" not in text,
+       "a lone source is not given the command menu")
+
+
 def main():
     keep = len(sys.argv) > 1
     root = sys.argv[1] if keep else tempfile.mkdtemp(prefix="claude-move-tests-")
@@ -582,7 +607,8 @@ def main():
         for test in (test_core_migration, test_dry_run, test_merge, test_blockers,
                      test_already_moved, test_destination_is_a_directory,
                      test_multiple_sources, test_wildcards, test_batch_blockers,
-                     test_escaped_non_ascii, test_prefix_siblings, test_list):
+                     test_escaped_non_ascii, test_prefix_siblings, test_list,
+                     test_no_arguments):
             test(root)
     finally:
         if not keep:
