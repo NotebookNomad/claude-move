@@ -2248,9 +2248,23 @@ class Relocations:
         for path, state in self.projects.items():
             self._claimants.setdefault(state, set()).add(path)
         self.here = {p for p in self.projects if os.path.isdir(p)}
+        # Somewhere a project could have moved *to* has to be a project
+        # itself.  `known_projects` also hands back every cwd a transcript
+        # recorded, so without this a scratch directory inside a live project
+        # -- or one of Claude Code's own worktrees -- can be offered as the
+        # new home of a missing project that shares its last segment, on the
+        # strength of nothing but the name.  prune then refuses to delete
+        # state because of it, and repair rewrites paths to it.
+        #
+        # `here` itself stays wide: `index` uses it to stop the home search
+        # descending into a project, and a cwd inside one is exactly where
+        # that search should stop.
+        entries = {norm(key) for key in config_projects(read_json(layout.config, {}))}
+        counts = {project for _line, project in history_entries(layout) if project}
         self.by_name: Dict[str, Set[str]] = {}
         for path in self.here:
-            self.by_name.setdefault(os.path.basename(path), set()).add(path)
+            if kept_state(self.projects[path], (path,), entries, counts):
+                self.by_name.setdefault(os.path.basename(path), set()).add(path)
         self._index: Optional[Dict[str, Set[str]]] = None
         self._from_state_dirs()
 

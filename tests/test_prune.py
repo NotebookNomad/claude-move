@@ -300,6 +300,22 @@ class PruneTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("Checked 3 project(s)", out)
 
+    def test_a_subdirectory_is_not_offered_as_where_a_project_went(self):
+        """`by_name` is the source for "the only project Claude knows by that
+        name".  A cwd is not a project, so a scratch directory inside a live
+        one must not become the proposed new home of a missing project that
+        happens to share its last segment -- prune would refuse to delete
+        state on the strength of it, and repair would rewrite paths to it."""
+        api = self.m.alive("dev/api", session="s-1")
+        self.m.record_cwd(api, "s-1", self.make_dir("dev/api/workspace"))
+        self.m.gone("elsewhere/workspace", session="s-2")
+
+        code, out = self.m.prune("-n", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Moved rather than deleted", out)
+        self.assertNotIn(self.path("dev/api/workspace"), out)
+        self.assertIn("elsewhere/workspace", out)
+
     def test_naming_one_project_never_reaches_another(self):
         """A cwd recorded inside a transcript can name a different project.
 
