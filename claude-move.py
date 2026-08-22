@@ -34,7 +34,7 @@ Usage:
     claude-move.py '/dev/api-*' /existing/dir     # quoted glob, expanded here
     claude-move.py /old/path /new/path --dry-run  # show the plan only
     claude-move.py /old/path /new/path --state-only   # folder already moved
-    claude-move.py --list                         # show known projects
+    claude-move.py --list                         # show projects with state
 
     claude-move.py export -o state.tar.gz         # pack it up on this machine
     claude-move.py inspect state.tar.gz           # what a bundle holds
@@ -3506,7 +3506,7 @@ def build_parser() -> argparse.ArgumentParser:
   claude-move.py ~/dev/api ~/work/api --dry-run  show the plan, change nothing
   claude-move.py ~/dev/api ~/work/api --state-only
                                                  folder already moved by hand
-  claude-move.py --list                          list known projects
+  claude-move.py --list                          projects Claude has state for
 
 Moving more than one project requires the destination to be an existing
 directory; each keeps its own name inside it.

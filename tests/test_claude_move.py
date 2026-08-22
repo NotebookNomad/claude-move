@@ -596,7 +596,10 @@ def test_no_arguments(root):
     print("== the message a bare invocation gets ==")
     home, old, _, _ = fixture(root, "bare")
 
-    bare = subprocess.run([sys.executable, SCRIPT], capture_output=True, text=True)
+    # no --claude-dir/--config, to exercise a genuinely empty argv -- so point
+    # HOME at the fixture, which is what those defaults expand against
+    bare = subprocess.run([sys.executable, SCRIPT], capture_output=True, text=True,
+                          env={**os.environ, "HOME": home})
     result = run(home)
     text = result.stdout + result.stderr
     ok(result.returncode == 2, "flags but no paths exits 2")
