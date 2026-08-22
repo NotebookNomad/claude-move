@@ -1333,15 +1333,22 @@ def human(size: float) -> str:
     return f"{round(size)}G"
 
 
-def tree_size(path: str) -> int:
-    total = 0
+def tree_stat(path: str) -> Tuple[int, float]:
+    """Total bytes under `path`, and when anything in it was last written."""
+    total, newest = 0, 0.0
     for root, _, files in os.walk(path):
         for name in files:
             try:
-                total += os.path.getsize(os.path.join(root, name))
+                info = os.stat(os.path.join(root, name))
             except OSError:
-                pass
-    return total
+                continue
+            total += info.st_size
+            newest = max(newest, info.st_mtime)
+    return total, newest
+
+
+def tree_size(path: str) -> int:
+    return tree_stat(path)[0]
 
 
 def same_bytes(a: str, b: str) -> bool:
@@ -1392,25 +1399,36 @@ def copy_state_dir(src: str, dst: str, parts: Parts) -> None:
             raise OSError(f"could not copy {source}: {exc}")
 
 
-def history_lines_for(layout: Layout, paths: Set[str]) -> List[str]:
-    """Lines of ~/.claude/history.jsonl belonging to the exported projects."""
+def history_entries(layout: Layout) -> List[Tuple[str, Optional[str]]]:
+    """Every line of ~/.claude/history.jsonl, paired with the project it names.
+
+    A blank or unparseable line is kept with no project rather than dropped, so
+    that reading the file in order to remove one project's lines can put the
+    rest back exactly as they were.
+    """
+    out: List[Tuple[str, Optional[str]]] = []
     if not os.path.isfile(layout.history):
-        return []
-    out: List[str] = []
+        return out
     try:
         with open(layout.history, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if not line.strip():
-                    continue
+                if not line.endswith("\n"):
+                    line += "\n"
                 try:
-                    rec = json.loads(line)
+                    rec = json.loads(line) if line.strip() else None
                 except ValueError:
-                    continue
-                if isinstance(rec, dict) and norm(str(rec.get("project", ""))) in paths:
-                    out.append(line if line.endswith("\n") else line + "\n")
+                    rec = None
+                project = rec.get("project") if isinstance(rec, dict) else None
+                out.append((line, norm(str(project)) if project else None))
     except OSError:
         pass
     return out
+
+
+def history_lines_for(layout: Layout, paths: Set[str]) -> List[str]:
+    """Lines of ~/.claude/history.jsonl belonging to the exported projects."""
+    return [line for line, project in history_entries(layout)
+            if project in paths]
 
 
 def filter_config(entry: Any, keep_all: bool) -> Any:
@@ -1435,6 +1453,15 @@ def stage_globals(staged: str, layout: Layout, log: Log) -> None:
             log.step(f"global: {name}/")
 
 
+def matches_pattern(path: str, pattern: str) -> bool:
+    """One project path against one command-line pattern: an exact path, a
+    bare directory name ("api" matches ~/dev/api), or a shell-style pattern."""
+    literal = norm(pattern)
+    if _GLOB_MAGIC.search(pattern):
+        return glob_match(path, literal)
+    return path == literal or os.path.basename(path) == pattern
+
+
 def select(projects: Dict[str, str], patterns: List[str],
            log: Log) -> Dict[str, str]:
     """Filter discovered projects by the command line.
@@ -1448,12 +1475,7 @@ def select(projects: Dict[str, str], patterns: List[str],
         return projects
     chosen: Dict[str, str] = {}
     for pattern in patterns:
-        literal = norm(pattern)
-        if _GLOB_MAGIC.search(pattern):
-            hits = [p for p in projects if glob_match(p, literal)]
-        else:
-            hits = [p for p in projects
-                    if p == literal or os.path.basename(p) == pattern]
+        hits = [p for p in projects if matches_pattern(p, pattern)]
         if not hits:
             log.warn(f"no project matches {pattern!r}")
         for hit in hits:
@@ -2182,6 +2204,9 @@ class Relocations:
         # list are both needed below
         self.cwds: Dict[str, Set[str]] = {}
         self.projects = known_projects(layout, log, self.cwds)
+        self._claimants: Dict[str, Set[str]] = {}
+        for path, state in self.projects.items():
+            self._claimants.setdefault(state, set()).add(path)
         self.here = {p for p in self.projects if os.path.isdir(p)}
         self.by_name: Dict[str, Set[str]] = {}
         for path in self.here:
@@ -2190,6 +2215,17 @@ class Relocations:
         self._from_state_dirs()
 
     # -- evidence ---------------------------------------------------------
+
+    def claims(self, state: str) -> Set[str]:
+        """Every project path that resolves onto one state directory.
+
+        Two sources, both already scanned: the cwds its transcripts record,
+        and every path `known_projects` mapped onto it -- which is where its
+        config entry and its decoded name have been accounted for.  Asked in
+        one place because more than one command has to ask it, and a rule
+        added to one copy would be missing from the other.
+        """
+        return self._claimants.get(state, set()) | self.cwds.get(state, set())
 
     def _from_state_dirs(self) -> None:
         """The certain kind: a state directory that names both a path which is
@@ -2200,15 +2236,11 @@ class Relocations:
         onto it, which is where its config entry and its decoded name have
         already been accounted for.
         """
-        claimants: Dict[str, Set[str]] = {}
-        for path, state in self.projects.items():
-            claimants.setdefault(state, set()).add(path)
-        for state, recorded in self.cwds.items():
+        for state in self.cwds:
             # a session can run with its cwd inside ~/.claude; that is not a
             # project, and so not evidence about one either
-            claims = {cwd for cwd in recorded
-                      if not is_under(cwd, self.layout.dir)}
-            claims |= claimants.get(state, set())
+            claims = {c for c in self.claims(state)
+                      if not is_under(c, self.layout.dir)}
             here = {c for c in claims if os.path.isdir(c)}
             if len(here) != 1:
                 continue
@@ -2454,6 +2486,8 @@ class Repair:
                 self.log.info(f"     wording before applying -- a rewrite may "
                               f"not be what you want here.")
         self.describe_unknown()
+        self.describe_state_dirs()
+        self.describe_live()
 
     def describe_references(self, finding: "Finding") -> List[bool]:
         """Quote each line this finding would rewrite, before and after.
@@ -2486,8 +2520,6 @@ class Repair:
                 self.log.info(f"       ... and {len(changed) - CONTEXT_SHOWN} "
                               f"more line(s) in the same file")
         return history
-        self.describe_state_dirs()
-        self.describe_live()
 
     def describe_live(self) -> None:
         """A running session is not the blocker here that it is for a move --
@@ -2549,23 +2581,7 @@ class Repair:
         certain ones, so the answer has to be able to name a subset."""
         if self.args.yes:
             return self.findings
-        count = len(self.findings)
-        answer = ask("\nApply? [a] all, [n] none"
-                     + (f", or numbers like 1,3 (1-{count})" if count > 1 else "")
-                     + " ")
-        if answer is None:
-            return []
-        if answer in ("a", "all", "y", "yes"):
-            return self.findings
-        if answer in ("", "n", "no", "none"):
-            return []
-        picked: Dict[int, None] = {}
-        for word in re.split(r"[,\s]+", answer):
-            if word.isdigit() and 1 <= int(word) <= count:
-                picked[int(word) - 1] = None
-            elif word:
-                self.log.warn(f"ignoring {word!r}")
-        return [self.findings[i] for i in sorted(picked)]
+        return pick(self.findings, "Apply?", self.log)
 
     def backup(self, files: List[str]) -> Optional[str]:
         if self.args.no_backup:
@@ -2626,6 +2642,431 @@ def do_repair(args: argparse.Namespace, layout: Layout, log: Log) -> int:
         return 1
     log.info()
     repair.apply(chosen)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# prune: state left behind by folders that are gone
+# ---------------------------------------------------------------------------
+
+# how many orphans to describe in full before summarising the rest
+ORPHANS_SHOWN = 20
+
+
+def all_session_ids(layout: Layout) -> Set[str]:
+    """Every session id that still has a transcript on disk."""
+    out: Set[str] = set()
+    for state in state_dirs(layout):
+        out.update(session_ids(state))
+    return out
+
+
+def file_history_dirs(layout: Layout) -> List[str]:
+    """The per-session folders of /rewind blobs."""
+    if not os.path.isdir(layout.file_history):
+        return []
+    paths = (os.path.join(layout.file_history, name)
+             for name in sorted(os.listdir(layout.file_history)))
+    return [p for p in paths if os.path.isdir(p)]
+
+
+class Orphan:
+    """Everything one vanished project left behind, and what it is worth.
+
+    Also carries the file-history blobs that belong to no project at all --
+    one group of them, with no path and no state directory of its own.
+    """
+
+    def __init__(self, paths: Iterable[str],
+                 state: Optional[str] = None) -> None:
+        self.paths = list(paths)    # real project paths first; see _examine
+        self.state = state
+        self.sessions = session_ids(state) if state else []
+        self.memory = len(memory_files(state)) if state else 0
+        self.config: List[str] = []     # ~/.claude.json keys naming these paths
+        self.history = 0                # lines of ~/.claude/history.jsonl
+        self.blobs: List[str] = []      # file-history folders
+        self._stat: Optional[Tuple[int, float]] = None
+
+    def stat(self) -> Tuple[int, float]:
+        """Bytes on disk, and when anything in here was last written."""
+        if self._stat is None:
+            total, newest = 0, 0.0
+            for path in ([self.state] if self.state else []) + self.blobs:
+                size, seen = tree_stat(path)
+                total, newest = total + size, max(newest, seen)
+            self._stat = (total, newest)
+        return self._stat
+
+    @property
+    def size(self) -> int:
+        return self.stat()[0]
+
+    def title(self, home: str) -> str:
+        if self.paths:
+            return short(self.paths[0], home)
+        if self.state:
+            # nothing on disk decodes onto it -- the encoded name is all there is
+            return os.path.basename(self.state)
+        return (f"file-history for {len(self.blobs)} session(s) whose "
+                f"transcripts are gone")
+
+    def details(self) -> str:
+        """The inventory line under the title."""
+        bits = []
+        if self.state:
+            bits.append(f"{len(self.sessions)} transcript(s)")
+            bits.append(f"{self.memory} memory file(s)")
+        if self.blobs and self.paths:
+            bits.append(f"{len(self.blobs)} file-history folder(s)")
+        if self.config:
+            bits.append("permissions and settings")
+        if self.history:
+            bits.append(f"{self.history} shell-history line(s)")
+        return ", ".join(bits)
+
+
+class Prune:
+    """Find the state whose project folder is gone, and delete what is picked.
+
+    The dangerous mistake here is repair's in reverse: repair rewrites a path
+    that had not moved, and prune deletes the state of a folder that had.  A
+    folder that moved looks exactly like one that was deleted -- the path is
+    missing either way -- so every candidate goes through the same hunt repair
+    uses, and anything with somewhere to point at is reported rather than
+    offered.  Only what nothing on this machine can account for is offered.
+    """
+
+    def __init__(self, args: argparse.Namespace, layout: Layout, log: Log) -> None:
+        self.args = args
+        self.layout = layout
+        self.log = log
+        self.relocations = Relocations(layout, log, search=not args.no_search)
+        self.orphans: List[Orphan] = []
+        self.moved: List[Clue] = []
+        self.checked = 0
+        # the config keyed as it is actually written, so an entry is removed by
+        # the key it has rather than by the normalised form we compare on
+        entries = (read_json(layout.config, {}) or {}).get("projects")
+        self.entries: Dict[str, List[str]] = {}
+        for key in (entries if isinstance(entries, dict) else {}):
+            self.entries.setdefault(norm(key), []).append(key)
+        # session id -> its folder of /rewind blobs.  Every state directory
+        # asks this the same question, and the answer does not change between
+        # them; looking it up per directory rescans the whole tree each time.
+        self.blob_dirs: Dict[str, str] = {
+            os.path.basename(d): d for d in file_history_dirs(layout)}
+        # project path -> how many lines of the shell history it owns
+        self.counts: Dict[str, int] = {}
+        for _line, project in history_entries(layout):
+            if project:
+                self.counts[project] = self.counts.get(project, 0) + 1
+
+    # -- scanning ---------------------------------------------------------
+
+    def scan(self) -> None:
+        # A state directory sitting on disk and one that only a config entry
+        # names are the same question asked about different leftovers.
+        candidates: Dict[str, Set[str]] = {s: set() for s in state_dirs(self.layout)}
+        for path, state in self.relocations.projects.items():
+            candidates.setdefault(state, set()).add(path)
+
+        for state in sorted(candidates):
+            self.checked += 1
+            orphan = self._examine(state, candidates[state])
+            if orphan:
+                self.orphans.append(orphan)
+
+        self._stray_blobs()
+        self.orphans.sort(key=lambda o: (-o.size, o.title(self.layout.home)))
+
+    def _examine(self, state: str, known: Set[str]) -> Optional[Orphan]:
+        """Whether one state directory is genuinely left over, and what of."""
+        claims = known | self.relocations.claims(state)
+        if not self._wanted(claims):
+            return None
+        if any(os.path.isdir(path) for path in claims):
+            return None                     # the project is still right there
+
+        # The folder may have been renamed together with its state directory,
+        # in which case nothing recorded inside either one names where it went
+        # -- but the encoded name still decodes onto it.
+        if any(os.path.isdir(c) for c in decode_state_dir(os.path.basename(state))):
+            return None
+
+        # A cwd inside ~/.claude is Claude's own scratch space rather than a
+        # project.  It still names this directory better than the encoded form
+        # does, so keep it -- but behind any real project path, which is what
+        # the user recognises and what a move would have to name.
+        owned = sorted(p for p in claims if not is_under(p, self.layout.dir))
+        scratch = sorted(p for p in claims if is_under(p, self.layout.dir))
+        # Of several claims the one this directory is *named* for is its
+        # owner; the rest are places a session happened to run and got its
+        # cwd recorded.  Naming it after whichever sorted first would put a
+        # passing visitor's name on the whole thing.
+        owned.sort(key=lambda p: encode_path(p) != os.path.basename(state))
+
+        for path in owned + scratch:
+            clue = self.relocations.resolve(path)
+            if clue:
+                # the clue may be about an ancestor that moved; say where this
+                # project itself lands under it, since that is the move to run
+                self.moved.append(Clue(path, remap(path, clue.old, clue.new),
+                                       clue.why, clue.sure))
+                return None
+
+        orphan = Orphan(owned + scratch, state if os.path.isdir(state) else None)
+        for path in orphan.paths:
+            orphan.config.extend(self.entries.get(path, []))
+            orphan.history += self.counts.get(path, 0)
+        orphan.blobs = [self.blob_dirs[sid] for sid in orphan.sessions
+                        if sid in self.blob_dirs]
+        if not (orphan.state or orphan.config or orphan.history or orphan.blobs):
+            # Nothing of it is actually here to delete.  A path can be known
+            # only from some other project's transcript -- a cwd a session
+            # once ran in -- and never have had state of its own.  Offering
+            # that is offering to delete nothing.
+            return None
+        return orphan
+
+    def _stray_blobs(self) -> None:
+        """/rewind blobs whose transcript is gone.
+
+        Claude Code deletes transcripts once they age past its retention
+        setting; the blobs they refer to stay, and nothing else ever collects
+        them.  Naming projects narrows this command to those projects, and
+        these belong to none.
+        """
+        if self.args.projects:
+            return
+        live = all_session_ids(self.layout)
+        stray = [d for sid, d in sorted(self.blob_dirs.items()) if sid not in live]
+        if stray:
+            group = Orphan([])
+            group.blobs = stray
+            self.orphans.append(group)
+
+    def _wanted(self, claims: Iterable[str]) -> bool:
+        """Whether the command line asked about this one.  Applied before the
+        hunt for where it went, so naming one project neither reports another
+        one's move nor pays for the search that found it."""
+        return not self.args.projects or any(
+            matches_pattern(path, pattern)
+            for path in claims for pattern in self.args.projects)
+
+    # -- reporting --------------------------------------------------------
+
+    def shorten(self, path: str) -> str:
+        return short(path, self.layout.home)
+
+    @property
+    def total(self) -> int:
+        return sum(o.size for o in self.orphans)
+
+    def describe(self) -> None:
+        log = self.log
+        log.info(f"Checked {self.checked} project(s) Claude has state for")
+        self.describe_moved()
+        if not self.orphans:
+            return
+        log.info()
+        log.info("Gone from disk, with nothing on this machine to say where "
+                 "they went:")
+        for i, orphan in enumerate(self.orphans[:ORPHANS_SHOWN], 1):
+            log.info()
+            log.info(f"  {i}. {orphan.title(self.layout.home)}   "
+                     f"{human(orphan.size)}")
+            details = orphan.details()
+            if details:
+                log.info(f"     {details}")
+            for path in orphan.paths[1:]:
+                log.info(f"     {self.shorten(path)} maps onto the same "
+                         f"state, and is gone too")
+            newest = orphan.stat()[1]
+            if newest:
+                log.info(f"     last written "
+                         f"{time.strftime('%Y-%m-%d', time.localtime(newest))}")
+        if len(self.orphans) > ORPHANS_SHOWN:
+            rest = self.orphans[ORPHANS_SHOWN:]
+            log.info()
+            log.info(f"  ... and {len(rest)} more, {human(sum(o.size for o in rest))} "
+                     f"in total -- too many to number, but [a] covers them")
+
+    def describe_moved(self) -> None:
+        """A folder that moved is the one thing here that must not be deleted,
+        so say where it went and name the command that follows it."""
+        if not self.moved:
+            return
+        self.log.info()
+        self.log.info("Moved rather than deleted -- left alone:")
+        for clue in sorted(self.moved, key=lambda c: c.old):
+            self.log.info()
+            self.log.info(f"  {self.shorten(clue.old)}  ->  "
+                          f"{self.shorten(clue.new)}"
+                          f"{'' if clue.sure else '   (a guess)'}")
+            self.log.info(f"     {clue.why}")
+            self.log.info(f"     to carry its state across, run:")
+            self.log.info(f"       claude-move.py --state-only "
+                          f"{self.shorten(clue.old)} {self.shorten(clue.new)}")
+
+    def describe_live(self, chosen: List[Orphan]) -> None:
+        """A running session writes ~/.claude.json back as it exits, which
+        would put the entries just removed straight back."""
+        if not any(o.config for o in chosen) or not live_project_paths(self.layout):
+            return
+        self.log.warn("Claude Code is running somewhere -- it holds "
+                      "~/.claude.json in memory and may write\n"
+                      "           the removed settings back when it exits.  "
+                      "Quit it and re-run if they come back.")
+
+    # -- applying ---------------------------------------------------------
+
+    def choose(self) -> List[Orphan]:
+        """Which orphans to delete.  Only the numbered ones can be picked out
+        individually; [a] takes the summarised tail as well."""
+        if self.args.yes:
+            return self.orphans
+        return pick(self.orphans, "Delete?", self.log,
+                    min(len(self.orphans), ORPHANS_SHOWN))
+
+    def doomed_paths(self, chosen: List[Orphan]) -> Set[str]:
+        return {path for o in chosen if o.history for path in o.paths}
+
+    def doomed_entries(self, chosen: List[Orphan], config: Any) -> Dict[str, Any]:
+        """The ~/.claude.json project entries the chosen orphans own, under the
+        keys they are written with."""
+        entries = config.get("projects") if isinstance(config, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        keys = {key for o in chosen for key in o.config}
+        return {k: v for k, v in entries.items() if k in keys}
+
+    def backup(self, chosen: List[Orphan],
+               history: List[Tuple[str, Optional[str]]],
+               config: Any) -> Optional[str]:
+        """Open the backup and save the two things that are edited rather than
+        removed: the config entries and the shell-history lines.
+
+        The directories themselves are not copied here.  They are *moved* into
+        this same backup as they go (see `retire`), which costs nothing and
+        needs no free space -- and a command whose whole point is reclaiming
+        space must not demand a spare copy of everything first.
+        """
+        if self.args.no_backup:
+            return None
+        root = os.path.join(backup_root(self.layout), "pruned")
+        os.makedirs(root, exist_ok=True)
+        entries = self.doomed_entries(chosen, config)
+        if entries:
+            write_json_atomic(os.path.join(root, "config.json"),
+                              {"projects": entries})
+        doomed = self.doomed_paths(chosen)
+        dropped = [line for line, project in history if project in doomed]
+        if dropped:
+            write_text_atomic(os.path.join(root, "history.jsonl"),
+                              "".join(dropped))
+        return root
+
+    @staticmethod
+    def retire(path: str, root: Optional[str], where: str) -> None:
+        """See one directory out: into the backup if there is one, and
+        straight to deletion if the user waived it."""
+        if root is None:
+            shutil.rmtree(path)
+            return
+        dest = os.path.join(root, where, os.path.basename(path))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(path, dest)
+
+    def apply(self, chosen: List[Orphan]) -> None:
+        freed = sum(o.size for o in chosen)
+        # Read both files once here rather than trusting the scan: a live
+        # session may have written to them since, and what is saved and what
+        # is removed have to be the same snapshot or the backup will not hold
+        # everything that went.
+        history = history_entries(self.layout)
+        config = read_json(self.layout.config, {}) or {}
+
+        root = self.backup(chosen, history, config)
+        trees, blobs = 0, 0
+        for orphan in chosen:
+            if orphan.state:
+                self.retire(orphan.state, root, "projects")
+                trees += 1
+            for blob in orphan.blobs:
+                self.retire(blob, root, "file-history")
+                blobs += 1
+
+        done = [(trees, "state directory(s)"),
+                (blobs, "file-history folder(s)"),
+                (self.forget_config(chosen), "config entry(s)"),
+                (self.forget_history(chosen, history), "shell-history line(s)")]
+        self.log.step("deleted " + ", ".join(f"{n} {what}"
+                                             for n, what in done if n))
+        if root:
+            # the space is not back yet, and saying it is would be a lie the
+            # user only finds out about when the disk stays full
+            self.log.step(f"{human(freed)} moved to {root}")
+            self.log.step("delete that directory to reclaim the space")
+        else:
+            self.log.step(f"reclaimed {human(freed)}")
+
+    def forget_config(self, chosen: List[Orphan]) -> int:
+        keys = {key for o in chosen for key in o.config}
+        if not keys:
+            return 0
+        # re-read rather than trust the scan: a session may have rewritten the
+        # file since, and a key no longer in it is already forgotten
+        config = read_json(self.layout.config, {}) or {}
+        entries = config.get("projects")
+        if not isinstance(entries, dict):
+            return 0
+        gone = [k for k in keys if k in entries]
+        for key in gone:
+            del entries[key]
+        if gone:
+            write_json_atomic(self.layout.config, config)
+        return len(gone)
+
+    def forget_history(self, chosen: List[Orphan],
+                       history: List[Tuple[str, Optional[str]]]) -> int:
+        doomed = self.doomed_paths(chosen)
+        if not doomed:
+            return 0
+        kept = [line for line, project in history if project not in doomed]
+        if len(kept) == len(history):
+            return 0
+        write_text_atomic(self.layout.history, "".join(kept))
+        return len(history) - len(kept)
+
+
+def do_prune(args: argparse.Namespace, layout: Layout, log: Log) -> int:
+    prune = Prune(args, layout, log)
+    prune.scan()
+    prune.describe()
+
+    if not prune.orphans:
+        log.info()
+        # naming projects that match nothing is a mistyped argument, not a
+        # clean bill of health, and must not read as one
+        log.info("nothing left over for the projects named" if args.projects
+                 else "nothing to prune -- every project Claude has state for "
+                      "is still on disk")
+        return 0
+    log.info()
+    log.info(f"{len(prune.orphans)} item(s), {human(prune.total)} in total")
+    if args.dry_run:
+        log.info()
+        log.info("dry run -- nothing was deleted")
+        return 0
+
+    chosen = prune.choose()
+    if not chosen:
+        log.info("nothing deleted")
+        return 1
+    prune.describe_live(chosen)
+    log.info()
+    prune.apply(chosen)
     return 0
 
 
@@ -2716,9 +3157,35 @@ def confirm(prompt: str) -> bool:
     return ask(f"{prompt} [y/N] ") in ("y", "yes")
 
 
+def pick(items: List[Any], verb: str, log: Log,
+         numbered: Optional[int] = None) -> List[Any]:
+    """Which of a numbered list to act on: all of it, none of it, or some.
+
+    `numbered` caps what a number can reach, for a list too long to print in
+    full -- "all" still means all of it.  Shared because every command that
+    asks this has to parse the same answer, and a second copy is a second
+    place for "1,3" to stop meaning what it means here.
+    """
+    count = len(items) if numbered is None else numbered
+    answer = ask(f"\n{verb} [a] all, [n] none"
+                 + (f", or numbers like 1,3 (1-{count})" if count > 1 else "")
+                 + " ")
+    if answer is None or answer in ("", "n", "no", "none"):
+        return []
+    if answer in ("a", "all", "y", "yes"):
+        return list(items)
+    picked: Dict[int, None] = {}
+    for word in re.split(r"[,\s]+", answer):
+        if word.isdigit() and 1 <= int(word) <= count:
+            picked[int(word) - 1] = None
+        elif word:
+            log.warn(f"ignoring {word!r}")
+    return [items[i] for i in sorted(picked)]
+
+
 # the words that mean "not a move".  A folder genuinely called one of these is
 # still movable by qualifying it -- ./export, or an absolute path.
-SUBCOMMANDS = ("export", "inspect", "import", "repair")
+SUBCOMMANDS = ("export", "inspect", "import", "repair", "prune")
 
 # the only global flags that swallow the word after them, so the scan below
 # does not mistake a flag's value for a subcommand
@@ -2784,7 +3251,8 @@ def build_subcommand_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-move",
         description="Carry Claude Code's project state to another computer, "
-                    "or repair the paths it has left behind.",
+                    "repair the paths it has left behind, or delete the state "
+                    "of folders that are gone.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   claude-move.py export                          everything, every project
@@ -2801,6 +3269,9 @@ def build_subcommand_parser() -> argparse.ArgumentParser:
 
   claude-move.py repair                          stale paths in memory files
   claude-move.py repair -n                       what it found, change nothing
+
+  claude-move.py prune                           state for folders that are gone
+  claude-move.py prune -n                        what it found, delete nothing
 
 A full bundle holds your session transcripts.  Treat it as private, and
 encrypt it if it leaves your control.
@@ -2880,6 +3351,38 @@ it finds one of those is stale too.
                           "directory by name")
     rep.add_argument("--no-backup", action="store_true",
                      help="skip the safety copy of the memory files being changed")
+
+    pru = sub.add_parser(
+        "prune", parents=[shared],
+        help="delete state for folders that are gone",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Find the transcripts, memory, permissions and /rewind "
+                    "blobs Claude Code is still keeping for folders that no "
+                    "longer exist, and offer to delete them.  A folder that "
+                    "moved is reported, never offered.  Nothing goes without "
+                    "a copy in the backup directory first.",
+        epilog="""examples:
+  claude-move.py prune                      offer everything left over
+  claude-move.py prune -n                   show what it found, delete nothing
+  claude-move.py prune icepick-offsec       one project's leftovers only
+  claude-move.py prune --no-search          go on evidence alone, no hunting
+
+A missing folder was either deleted or moved, and the two look identical from
+here.  Anything this can find a new home for is listed as moved and left
+alone -- run repair, or the move it names, for those.
+""")
+    pru.add_argument("projects", nargs="*", metavar="PROJECT",
+                     help="project paths, directory names or patterns to "
+                          "consider; omit for everything left over")
+    pru.add_argument("-n", "--dry-run", action="store_true",
+                     help="report what it found, delete nothing")
+    pru.add_argument("-y", "--yes", action="store_true",
+                     help="delete everything found without asking")
+    pru.add_argument("--no-search", action="store_true",
+                     help="do not hunt the home directory for a moved "
+                          "directory by name")
+    pru.add_argument("--no-backup", action="store_true",
+                     help="skip the safety copy of what is being deleted")
     return parser
 
 
@@ -2896,8 +3399,8 @@ def main_subcommand(argv: List[str]) -> int:
         if not os.path.isdir(layout.dir):
             log.error(f"no Claude state directory at {layout.dir}")
             return 1
-        return do_export(args, layout, log) if args.command == "export" \
-            else do_repair(args, layout, log)
+        return {"export": do_export, "repair": do_repair,
+                "prune": do_prune}[args.command](args, layout, log)
     except (ValueError, tarfile.TarError, OSError) as exc:
         log.error(str(exc))
         return 1
@@ -2932,6 +3435,10 @@ To carry state to another computer instead of moving it on this one:
 To clean up after a folder that was moved without this tool:
 
   claude-move.py repair                          stale paths in memory files
+
+To delete what folders that are gone for good left behind:
+
+  claude-move.py prune                           offers each one, asks first
 
 Run any of those with --help for their own options.
 """)

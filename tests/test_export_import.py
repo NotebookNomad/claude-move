@@ -8,7 +8,10 @@ project silently re-keyed, a neighbour matched by prefix -- so most of these
 assert that something stayed exactly as it was.
 """
 
+import builtins
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -91,6 +94,25 @@ class Machine:
     def run(self, *argv):
         return cm.main(list(argv) + ["--claude-dir", self.claude,
                                      "--config", self.config, "-q"])
+
+    def run_interactive(self, subcommand, *argv, answer=None):
+        """Run a subcommand that asks a question before it acts, returning
+        (exit code, everything it printed).
+
+        `answer` is what to type at the prompt; None closes stdin instead,
+        which is what a pipe or a cron job looks like.
+        """
+        out = io.StringIO()
+        real_input = builtins.input
+        builtins.input = lambda _p="": (_ for _ in ()).throw(EOFError) \
+            if answer is None else answer
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = cm.main([subcommand, *argv, "--claude-dir", self.claude,
+                                "--config", self.config])
+        finally:
+            builtins.input = real_input
+        return code, out.getvalue()
 
     def config_projects(self):
         return json.loads(read(self.config))["projects"]

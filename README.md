@@ -243,6 +243,85 @@ Locations it cannot place are listed separately and left exactly as written.
 > moved, its conversations and permissions need moving too — the run tells you
 > so, and prints the `--state-only` command that does it.
 
+## "Claude is still holding on to folders I deleted"
+
+Delete a project folder and Claude Code keeps everything it remembered about
+it — the conversations, the memory files, the permissions — filed under a
+location that no longer exists. Nothing ever clears that out, so it builds up.
+
+```bash
+./claude-move.py prune
+```
+
+It goes through every project Claude has records for, finds the ones whose
+folder is gone, and offers them to you:
+
+```
+Gone from disk, with nothing on this machine to say where they went:
+
+  1. ~/dev/scratch-api   3.2M
+     14 transcript(s), 2 memory file(s), permissions and settings, 6 shell-history line(s)
+     last written 2026-03-04
+
+  2. file-history for 22 session(s) whose transcripts are gone   41M
+
+Delete? [a] all, [n] none, or numbers like 1,3 (1-2)
+```
+
+Same answers as `repair`: `a` for all, `n` for none, or numbers for some.
+Nothing goes until you answer, and `-n` shows the list and then stops.
+
+### A deleted folder and a moved folder look identical
+
+This is the one command here that throws anything away, and from the outside
+those two cases are the same thing — the location is missing either way.
+Deleting the records of a folder that merely *moved* would destroy the very
+thing this tool exists to protect.
+
+So before offering anything, `prune` goes looking for it: in Claude's own
+records, in the projects it already knows by name, and in your home folder.
+Anything it can still find a home for is reported instead, with the command
+that follows it:
+
+```
+Moved rather than deleted -- left alone:
+
+  ~/dev/api  ->  ~/work/api
+     Claude's own state for that project resolves to it
+     to carry its state across, run:
+       claude-move.py --state-only ~/dev/api ~/work/api
+```
+
+Those are never offered for deletion, and `-y` does not override it. The same
+goes for anything still in use that merely *looks* abandoned: a folder renamed
+along with its records, two folders sharing one storage folder where either one
+still exists, or a project whose conversations name a location that is still
+there. `--no-search` turns off the home-folder hunt, leaving the evidence
+Claude's own records provide.
+
+That second item in the list is worth knowing about on its own. Claude Code
+deletes old conversations once they pass its retention setting, but the file
+copies behind `/rewind` stay — one folder per conversation, and nothing ever
+removes them. On a machine that has seen a lot of use they are usually the
+largest thing `prune` finds.
+
+**Nothing is deleted outright** — it is moved into a dated folder under
+`~/.claude/claude-move-backups/`, so a prune you regret is a copy back out of
+there. Because that folder is on the same disk, moving costs nothing and needs
+no free space: a command for reclaiming space should not demand a spare copy of
+everything first.
+
+The flip side is that the space is not actually back until you delete that
+backup folder, and the run says so rather than claiming a reclaim it hasn't
+made. Once you've confirmed nothing you wanted went with it:
+
+```bash
+rm -rf ~/.claude/claude-move-backups/<the-dated-folder>
+```
+
+`--no-backup` skips the safety copy and deletes as it goes, if you would rather
+not have the two-step.
+
 ## If something goes wrong
 
 **Everything is backed up before it is touched**, into a dated folder at
@@ -319,6 +398,15 @@ everything once and take only part of it on a given machine
 | `-n`, `--dry-run` | Show what it found, change nothing |
 | `-y`, `--yes` | Apply everything found, guesses included, without asking |
 | `--no-search` | Don't match a missing folder to one of the same name elsewhere |
+| `--no-backup` | Skip the safety copy |
+
+**`prune [PROJECT ...]`** — with no projects named, it considers them all
+
+| Flag | Effect |
+| --- | --- |
+| `-n`, `--dry-run` | Show what it found, delete nothing |
+| `-y`, `--yes` | Delete everything it offers without asking |
+| `--no-search` | Don't hunt your home folder for a missing folder before offering it |
 | `--no-backup` | Skip the safety copy |
 
 </details>
@@ -467,6 +555,7 @@ python3 tests/test_claude_move.py            # runs in a temp dir, cleaned up
 python3 tests/test_claude_move.py /tmp/keep  # keep the fixtures to inspect
 python3 tests/test_export_import.py          # the export/import round trip
 python3 tests/test_repair.py                 # what repair fixes, and what it won't
+python3 tests/test_prune.py                  # what prune deletes, and what it refuses to
 ```
 
 The move suite builds a synthetic `~/.claude` mirroring the real layout and
@@ -479,6 +568,10 @@ project never named on the command line did not come across, that a
 prefix-sharing neighbour (`api-server` beside `api`) kept its own name, that a
 bystander already on the target was untouched, that the source machine was never
 written to. That is where this class of tool actually breaks.
+
+The prune suite is almost entirely negatives, for the same reason: every one of
+its refusals was checked by breaking that check on purpose and confirming a test
+noticed. One of them didn't, the first time round, and that gap is now a test.
 
 Your real `~/.claude` is never touched by either.
 

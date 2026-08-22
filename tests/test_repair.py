@@ -8,9 +8,6 @@ disk, a slash command that looks like one.  Those are the assertions that
 would have caught every bug this feature had while it was being written.
 """
 
-import builtins
-import contextlib
-import io
 import json
 import os
 import shutil
@@ -42,17 +39,7 @@ class Fixture(Machine):
 
     def repair(self, *argv, answer=None):
         """Run repair, returning (exit code, everything it printed)."""
-        out = io.StringIO()
-        real_input = builtins.input
-        builtins.input = lambda _prompt="": (_ for _ in ()).throw(EOFError) \
-            if answer is None else answer
-        try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                code = cm.main(["repair", *argv, "--claude-dir", self.claude,
-                                "--config", self.config])
-        finally:
-            builtins.input = real_input
-        return code, out.getvalue()
+        return self.run_interactive("repair", *argv, answer=answer)
 
 
 class RepairTest(unittest.TestCase):
