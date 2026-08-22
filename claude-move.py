@@ -275,16 +275,30 @@ class Rewriter:
             self._pairs.append((old, new, re.compile(re.escape(old) + _SEGMENT_END)))
             self._pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
-    def text(self, value: str) -> str:
-        out = value
+    def _apply(self, value: str) -> Tuple[str, int]:
+        out, changes = value, 0
         for old, new, pattern in self._pairs:
             if old in out:   # cheap guard; the regex can only match where this does
                 # a function replacement, so backslashes in `new` (the
                 # JSON-escaped spellings are full of them) stay literal
-                out = pattern.sub(lambda _match, new=new: new, out)
-        if out != value:
+                out, made = pattern.subn(lambda _match, new=new: new, out)
+                changes += made
+        return out, changes
+
+    def text(self, value: str) -> str:
+        out, changes = self._apply(value)
+        if changes:
             self.hits += 1
         return out
+
+    def count(self, value: str) -> int:
+        """How many substitutions `text` would make.
+
+        Counted by actually making them, longest match first, so a state
+        directory name counts once rather than once per shorter spelling it
+        happens to contain.
+        """
+        return self._apply(value)[1]
 
     def obj(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -393,6 +407,30 @@ class FileRewriter:
         if path not in self.stale and self.rules.touches(text):
             self.stale.append(path)
         return text
+
+
+def backup_root(layout: "Layout") -> str:
+    """A fresh dated directory for a safety copy.  Every command that takes one
+    puts it in the same place, which is the place the README tells people to
+    look."""
+    return os.path.join(layout.dir, BACKUP_DIR, time.strftime("%Y%m%d-%H%M%S"))
+
+
+def project_pairs(layout: "Layout", old: str, new: str) -> List[Tuple[str, str]]:
+    """Every spelling of one project path that moving it changes.
+
+    A project's location is written down four ways -- the path, the state
+    directory derived from it, the ~-relative form, and the bare encoded token
+    on its own (inside scratchpad paths under /tmp, say).  A move and a repair
+    both have to correct all four, and a list built twice is a list that ends
+    up correcting three.
+    """
+    pairs = [(layout.state_dir(old), layout.state_dir(new)), (old, new)]
+    old_tilde, new_tilde = tilde(old, layout.home), tilde(new, layout.home)
+    if old_tilde and new_tilde:
+        pairs.append((old_tilde, new_tilde))
+    pairs.append((encode_path(old), encode_path(new)))
+    return pairs
 
 
 def tracked_backups(rec: Any) -> Iterator[Tuple[str, Dict[str, Any]]]:
@@ -507,7 +545,8 @@ def decode_state_dir(name: str) -> List[str]:
     return sorted(set(found))
 
 
-def known_projects(layout: Layout, log: Optional[Log] = None) -> Dict[str, str]:
+def known_projects(layout: Layout, log: Optional[Log] = None,
+                   cwds: Optional[Dict[str, Set[str]]] = None) -> Dict[str, str]:
     """Every project path Claude knows about -> its state directory.
 
     Three sources, in decreasing order of reliability: ~/.claude.json, the cwd
@@ -517,6 +556,9 @@ def known_projects(layout: Layout, log: Optional[Log] = None) -> Dict[str, str]:
     naming the path it moved away from -- nothing else on disk records that).
 
     `log`, when given, reports what the third pass found or could not resolve.
+    `cwds`, when given a dict, is filled with the cwd set found in each state
+    directory.  Reading those is the expensive half of this scan, and a caller
+    that needs them too should not pay for the transcripts twice.
     """
     found: Dict[str, str] = {}
     try:
@@ -527,7 +569,10 @@ def known_projects(layout: Layout, log: Optional[Log] = None) -> Dict[str, str]:
         pass
 
     for state in state_dirs(layout):
-        for cwd in cwds_in_state_dir(state):
+        recorded = cwds_in_state_dir(state)
+        if cwds is not None:
+            cwds[state] = recorded
+        for cwd in recorded:
             # a session can run with its cwd inside ~/.claude (e.g. a subagent
             # editing memory); that is not a project
             if not is_under(cwd, layout.dir):
@@ -693,13 +738,8 @@ class Plan:
 
     def _build_rewriter(self) -> None:
         for old, new in self.mappings:
-            self.rewriter.add(self.layout.state_dir(old), self.layout.state_dir(new))
-            self.rewriter.add(old, new)
-            old_tilde, new_tilde = tilde(old, self.home), tilde(new, self.home)
-            if old_tilde and new_tilde:
-                self.rewriter.add(old_tilde, new_tilde)
-            # the bare encoded token, e.g. inside scratchpad paths under /tmp
-            self.rewriter.add(encode_path(old), encode_path(new))
+            for spelling, replacement in project_pairs(self.layout, old, new):
+                self.rewriter.add(spelling, replacement)
 
     # -- target discovery -------------------------------------------------
 
@@ -1147,8 +1187,7 @@ class Batch:
         """One safety copy for the whole batch, taken before any of it runs."""
         if self.args.no_backup:
             return None
-        root = os.path.join(self.layout.dir, BACKUP_DIR,
-                            time.strftime("%Y%m%d-%H%M%S"))
+        root = backup_root(self.layout)
         files = os.path.join(root, "files")
         os.makedirs(files, exist_ok=True)
 
@@ -1728,8 +1767,7 @@ class Importer:
         any of it runs."""
         if self.args.no_backup:
             return None
-        root = os.path.join(self.layout.dir, BACKUP_DIR,
-                            time.strftime("%Y%m%d-%H%M%S"))
+        root = backup_root(self.layout)
         os.makedirs(root, exist_ok=True)
         if os.path.isfile(self.layout.config):
             shutil.copy2(self.layout.config, os.path.join(root, ".claude.json"))
@@ -2077,9 +2115,10 @@ class Relocations:
         self.log = log
         self.search = search
         self.clues: Dict[str, Clue] = {}
-        # one scan of every transcript, shared with whoever needs the project
-        # list afterwards
-        self.projects = known_projects(layout, log)
+        # one scan of every transcript, whose cwd sets and resolved project
+        # list are both needed below
+        self.cwds: Dict[str, Set[str]] = {}
+        self.projects = known_projects(layout, log, self.cwds)
         self.here = {p for p in self.projects if os.path.isdir(p)}
         self.by_name: Dict[str, Set[str]] = {}
         for path in self.here:
@@ -2091,19 +2130,23 @@ class Relocations:
 
     def _from_state_dirs(self) -> None:
         """The certain kind: a state directory that names both a path which is
-        gone and one which is here."""
-        cfg = read_json(self.layout.config, {}) or {}
-        keys = [norm(k) for k in (cfg.get("projects") or {})] \
-            if isinstance(cfg, dict) else []
-        for state in state_dirs(self.layout):
-            name = os.path.basename(state)
+        gone and one which is here.
+
+        What a state directory claims comes from the scan already done -- the
+        cwds its transcripts record, plus every path `known_projects` resolved
+        onto it, which is where its config entry and its decoded name have
+        already been accounted for.
+        """
+        claimants: Dict[str, Set[str]] = {}
+        for path, state in self.projects.items():
+            claimants.setdefault(state, set()).add(path)
+        for state, recorded in self.cwds.items():
             # a session can run with its cwd inside ~/.claude; that is not a
             # project, and so not evidence about one either
-            claims = {cwd for cwd in cwds_in_state_dir(state)
+            claims = {cwd for cwd in recorded
                       if not is_under(cwd, self.layout.dir)}
-            claims |= {key for key in keys if encode_path(key) == name}
+            claims |= claimants.get(state, set())
             here = {c for c in claims if os.path.isdir(c)}
-            here |= set(decode_state_dir(name))
             gone = sorted(c for c in claims if not os.path.isdir(c))
             if len(here) != 1 or not gone:
                 continue
@@ -2114,6 +2157,9 @@ class Relocations:
                                             "project resolves to it", True))
 
     def add(self, clue: Clue) -> None:
+        # proof beats a guess whichever order they turn up in; between two
+        # guesses the first wins, and `resolve` always tries the better source
+        # first, so that is the better guess rather than the earlier mention
         known = self.clues.get(clue.old)
         if known is None or (clue.sure and not known.sure):
             self.clues[clue.old] = clue
@@ -2200,27 +2246,21 @@ class Relocations:
 class Finding:
     """One relocation, and the memory files that still name the old path.
 
-    A project's path appears in memory in more than one spelling -- absolute
-    and ~-relative -- and its state directory name is derived from it, so all
-    of those are rewritten together or the file is left half-corrected.
+    Counting is done by the same Rewriter that will do the writing, so the
+    number reported to the user is by construction the number of replacements
+    they are agreeing to.
     """
 
     def __init__(self, clue: Clue, layout: Layout) -> None:
         self.clue = clue
         self.files: Dict[str, int] = {}
-        self.pairs: List[Tuple[str, str]] = [(clue.old, clue.new)]
-        state = layout.state_dir(clue.old), layout.state_dir(clue.new)
-        if state[0] != state[1]:
-            self.pairs.append(state)
-        for old, new in list(self.pairs):
-            spelled = tilde(old, layout.home)
-            if spelled:
-                self.pairs.append((spelled, tilde(new, layout.home) or new))
-        self._patterns = [re.compile(re.escape(old) + _SEGMENT_END)
-                          for old, _ in self.pairs]
+        self.pairs = project_pairs(layout, clue.old, clue.new)
+        self.rules = Rewriter()
+        for old, new in self.pairs:
+            self.rules.add(old, new)
 
     def count(self, path: str, text: str) -> None:
-        hits = sum(len(p.findall(text)) for p in self._patterns)
+        hits = self.rules.count(text)
         if hits:
             self.files[path] = hits
 
@@ -2365,13 +2405,10 @@ class Repair:
         if self.args.yes:
             return self.findings
         count = len(self.findings)
-        prompt = ("\nApply? [a] all, [n] none"
-                  + (f", or numbers like 1,3 (1-{count})" if count > 1 else "")
-                  + " ")
-        try:
-            answer = input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        answer = ask("\nApply? [a] all, [n] none"
+                     + (f", or numbers like 1,3 (1-{count})" if count > 1 else "")
+                     + " ")
+        if answer is None:
             return []
         if answer in ("a", "all", "y", "yes"):
             return self.findings
@@ -2388,8 +2425,7 @@ class Repair:
     def backup(self, files: List[str]) -> Optional[str]:
         if self.args.no_backup:
             return None
-        root = os.path.join(self.layout.dir, BACKUP_DIR,
-                            time.strftime("%Y%m%d-%H%M%S"), "memory")
+        root = os.path.join(backup_root(self.layout), "memory")
         for path in files:
             dest = os.path.join(root, self.relative(path))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -2512,16 +2548,27 @@ def cmd_list(layout: Layout, log: Log) -> int:
     return 0
 
 
-def confirm(prompt: str) -> bool:
+def ask(prompt: str) -> Optional[str]:
+    """One lowercased line from the user, or None when there is nobody there.
+
+    Both prompts in this tool answer an interrupt or a closed stdin the same
+    way -- by taking it as a refusal -- so that decision lives here rather than
+    in each of them.
+    """
     try:
-        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+        return input(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
-        return False
+        return None
 
 
-TRANSFER_COMMANDS = ("export", "inspect", "import")
-SUBCOMMANDS = TRANSFER_COMMANDS + ("repair",)
+def confirm(prompt: str) -> bool:
+    return ask(f"{prompt} [y/N] ") in ("y", "yes")
+
+
+# the words that mean "not a move".  A folder genuinely called one of these is
+# still movable by qualifying it -- ./export, or an absolute path.
+SUBCOMMANDS = ("export", "inspect", "import", "repair")
 
 # the only global flags that swallow the word after them, so the scan below
 # does not mistake a flag's value for a subcommand
@@ -2578,14 +2625,16 @@ def add_global_flags(parser: argparse.ArgumentParser) -> None:
                         help="only warnings and errors")
 
 
-def build_transfer_parser() -> argparse.ArgumentParser:
-    """export / inspect / import.  A move rewrites state in place on one
-    machine; these carry the same state to another one."""
+def build_subcommand_parser() -> argparse.ArgumentParser:
+    """Everything that is not a move.  A move rewrites state in place as a
+    folder goes; export and import carry that state to another machine, and
+    repair cleans up after the folders that went without this tool."""
     shared = repeated_globals()
 
     parser = argparse.ArgumentParser(
         prog="claude-move",
-        description="Carry Claude Code's project state to another computer.",
+        description="Carry Claude Code's project state to another computer, "
+                    "or repair the paths it has left behind.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   claude-move.py export                          everything, every project
@@ -2599,6 +2648,9 @@ def build_transfer_parser() -> argparse.ArgumentParser:
   claude-move.py import work.tar.gz              paths remapped to this home
   claude-move.py import work.tar.gz --into ~/code
   claude-move.py import work.tar.gz --map api=~/work/api
+
+  claude-move.py repair                          stale paths in memory files
+  claude-move.py repair -n                       what it found, change nothing
 
 A full bundle holds your session transcripts.  Treat it as private, and
 encrypt it if it leaves your control.
@@ -2648,41 +2700,9 @@ encrypt it if it leaves your control.
     imp.add_argument("--force", action="store_true",
                      help="proceed despite live sessions or mapping collisions")
     add_part_flags(imp, "import")
-    return parser
-
-
-def main_transfer(argv: List[str]) -> int:
-    args = build_transfer_parser().parse_args(argv)
-    log = Log(quiet=args.quiet)
-    layout = Layout(args.claude_dir, args.config)
-    try:
-        if args.command == "export":
-            if not os.path.isdir(layout.dir):
-                log.error(f"no Claude state directory at {layout.dir}")
-                return 1
-            return do_export(args, layout, log)
-        if args.command == "inspect":
-            return do_inspect(args, log)
-        os.makedirs(layout.projects, exist_ok=True)
-        return do_import(args, layout, log)
-    except (ValueError, tarfile.TarError, OSError) as exc:
-        log.error(str(exc))
-        return 1
-
-
-def build_repair_parser() -> argparse.ArgumentParser:
-    """repair.  A move keeps state correct as it happens; this cleans up after
-    the moves that happened without it."""
-    parser = argparse.ArgumentParser(
-        prog="claude-move",
-        description="Fix paths inside Claude Code's memory files that name a "
-                    "directory which has since moved.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    add_global_flags(parser)
-    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     rep = sub.add_parser(
-        "repair", parents=[repeated_globals()],
+        "repair", parents=[shared],
         help="fix stale paths in memory files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Read every memory file, find the paths that no longer "
@@ -2713,16 +2733,22 @@ it finds one of those is stale too.
     return parser
 
 
-def main_repair(argv: List[str]) -> int:
-    args = build_repair_parser().parse_args(argv)
+def main_subcommand(argv: List[str]) -> int:
+    args = build_subcommand_parser().parse_args(argv)
     log = Log(quiet=args.quiet)
     layout = Layout(args.claude_dir, args.config)
-    if not os.path.isdir(layout.dir):
-        log.error(f"no Claude state directory at {layout.dir}")
-        return 1
     try:
-        return do_repair(args, layout, log)
-    except OSError as exc:
+        if args.command == "inspect":       # reads a bundle, not this machine
+            return do_inspect(args, log)
+        if args.command == "import":
+            os.makedirs(layout.projects, exist_ok=True)
+            return do_import(args, layout, log)
+        if not os.path.isdir(layout.dir):
+            log.error(f"no Claude state directory at {layout.dir}")
+            return 1
+        return do_export(args, layout, log) if args.command == "export" \
+            else do_repair(args, layout, log)
+    except (ValueError, tarfile.TarError, OSError) as exc:
         log.error(str(exc))
         return 1
 
@@ -2791,11 +2817,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # move, so `claude-move.py ~/dev/api ~/work` keeps working untouched.  A
     # folder genuinely called "export" is still movable by qualifying it --
     # ./export or an absolute path.
-    word = first_word(argv)
-    if word in TRANSFER_COMMANDS:
-        return main_transfer(argv)
-    if word == "repair":
-        return main_repair(argv)
+    if first_word(argv) in SUBCOMMANDS:
+        return main_subcommand(argv)
 
     parser = build_parser()
     args = parser.parse_args(argv)

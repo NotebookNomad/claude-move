@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -61,7 +62,6 @@ class RepairTest(unittest.TestCase):
         self.home = self.m.home
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def path(self, rel):
