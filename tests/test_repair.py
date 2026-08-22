@@ -148,6 +148,44 @@ class RepairTest(unittest.TestCase):
         self.assertIn(f"nor this: {old}.bak", body)
         self.assertIn(f"moved: {new}", body)
 
+    def test_a_deleted_subdirectory_is_not_a_relocation(self):
+        """A session records a cwd inside the project -- a worktree under
+        .claude/, a scratch directory -- and that directory is later removed.
+        It was deleted, not moved: reading it as a relocation would collapse
+        every mention of a subdirectory onto the project root."""
+        project = self.make_dir("work/api")
+        worktree = os.path.join(project, ".claude", "worktrees", "feat")
+        scratch = os.path.join(project, "scratch")
+        self.m.sessions_naming(self.m.state(project), project, worktree, scratch)
+        self.m.memory(project, "notes.md",
+                      f"worktree at {worktree}\nscratch at {scratch}\n")
+
+        code, out = self.m.repair("-y")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.m.read_memory(project, "notes.md"),
+                         f"worktree at {worktree}\nscratch at {scratch}\n")
+        self.assertIn("nothing to fix", out)
+
+    def test_a_sibling_that_moved_is_still_found_alongside_one_that_was_deleted(self):
+        """The subdirectory guard must not swallow the real relocation sharing
+        its state directory."""
+        project = self.make_dir("work/api")
+        old = self.path("dev/api")
+        scratch = os.path.join(project, "scratch")
+        self.m.sessions_naming(self.m.state(project), old, scratch)
+        self.m.memory(project, "notes.md", f"was {old}, scratch {scratch}\n")
+
+        code, out = self.m.repair("-y")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.m.read_memory(project, "notes.md"),
+                         f"was {project}, scratch {scratch}\n")
+
+    def test_naming_a_project_that_matches_nothing_fails(self):
+        self.m.add_project("api", session="a1")
+
+        code, out = self.m.repair("nosuchproject", "-y")
+        self.assertEqual(code, 1, out)
+
     def test_paths_that_still_exist_are_left_alone(self):
         new = self.make_dir("work/api")
         keep = self.make_dir("work/other")

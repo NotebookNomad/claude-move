@@ -200,10 +200,13 @@ list and then stops.
 
 Some of what it finds is certain and some is a guess, and it says which is
 which. A location Claude's own records account for is certain. A folder matched
-only by its name — the same name, somewhere else on your disk — is labelled
-**a guess**, because a memory file might simply be quoting an example rather
-than pointing at a real place. Read those before accepting them, or pass
-`--no-search` to leave name-matching out of it entirely.
+only by its name is labelled **a guess**, because a memory file might simply be
+quoting an example rather than pointing at a real place. Read those before
+accepting them — declining one is just a matter of leaving its number out.
+
+The weakest guesses come from searching your home folder for a folder of the
+same name. `--no-search` turns that search off, leaving only the guesses drawn
+from projects Claude already knows about.
 
 Locations it cannot place are listed separately and left exactly as written.
 

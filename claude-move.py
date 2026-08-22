@@ -2147,10 +2147,15 @@ class Relocations:
                       if not is_under(cwd, self.layout.dir)}
             claims |= claimants.get(state, set())
             here = {c for c in claims if os.path.isdir(c)}
-            gone = sorted(c for c in claims if not os.path.isdir(c))
-            if len(here) != 1 or not gone:
+            if len(here) != 1:
                 continue
             new = here.pop()
+            # A path *inside* the surviving one was deleted, not moved: a
+            # scratch directory, or one of Claude Code's own worktrees under
+            # .claude/.  Reading those as relocations would collapse every
+            # mention of a subdirectory onto the project root.
+            gone = sorted(c for c in claims
+                          if not os.path.isdir(c) and not is_under(c, new))
             for old in gone:
                 if old != new:
                     self.add(Clue(old, new, "Claude's own state for that "
@@ -2358,6 +2363,22 @@ class Repair:
                               f"  ({finding.files[path]})")
         self.describe_unknown()
         self.describe_state_dirs()
+        self.describe_live()
+
+    def describe_live(self) -> None:
+        """A running session is not the blocker here that it is for a move --
+        nothing this command writes is held in ~/.claude.json -- but a session
+        with a memory file already open can write its own copy back over the
+        repair, so say so while the user can still answer no."""
+        live = sorted(p for p in live_project_paths(self.layout)
+                      if self.layout.state_dir(p) in self.dirs)
+        if not live:
+            return
+        self.log.info()
+        for path in live:
+            self.log.warn(f"Claude Code is running in {self.shorten(path)} -- "
+                          f"quit it first, or it may write its own copy of "
+                          f"these memory files back")
 
     def describe_unknown(self) -> None:
         if not self.unknown:
@@ -2456,6 +2477,11 @@ class Repair:
 def do_repair(args: argparse.Namespace, layout: Layout, log: Log) -> int:
     repair = Repair(args, layout, log)
     if not repair.dirs:
+        # naming projects that match nothing is a mistyped argument, not a
+        # clean bill of health, and must not read as one from a script
+        if args.projects:
+            log.error("no memory files to check for the projects named")
+            return 1
         log.info("no memory files to check")
         return 0
     repair.scan()
