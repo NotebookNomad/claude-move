@@ -61,8 +61,8 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import (Any, Callable, Container, Dict, Iterable, Iterator, List,
-                    Optional, Set, Tuple)
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Set, Tuple)
 
 # Directories under ~/.claude that the path sweep must not touch:
 #   projects/            the moved state dirs are handled explicitly; other
@@ -551,7 +551,8 @@ def decode_state_dir(name: str) -> List[str]:
 
 
 def known_projects(layout: Layout, log: Optional[Log] = None,
-                   cwds: Optional[Dict[str, Set[str]]] = None) -> Dict[str, str]:
+                   cwds: Optional[Dict[str, Set[str]]] = None,
+                   config: Any = None) -> Dict[str, str]:
     """Every project path Claude knows about -> its state directory.
 
     Three sources, in decreasing order of reliability: ~/.claude.json, the cwd
@@ -563,15 +564,14 @@ def known_projects(layout: Layout, log: Optional[Log] = None,
     `log`, when given, reports what the third pass found or could not resolve.
     `cwds`, when given a dict, is filled with the cwd set found in each state
     directory.  Reading those is the expensive half of this scan, and a caller
-    that needs them too should not pay for the transcripts twice.
+    that needs them too should not pay for the transcripts twice.  `config`,
+    when given the already-parsed ~/.claude.json, saves re-reading a file that
+    is routinely megabytes for the same reason.
     """
     found: Dict[str, str] = {}
-    try:
-        cfg = json.loads(read_text(layout.config) or "{}")
-        for path in (cfg.get("projects") or {}):
-            found[norm(path)] = layout.state_dir(norm(path))
-    except (ValueError, AttributeError):
-        pass
+    for path in config_projects(read_json(layout.config, {})
+                                if config is None else config):
+        found[norm(path)] = layout.state_dir(norm(path))
 
     for state in state_dirs(layout):
         recorded = cwds_in_state_dir(state)
@@ -602,34 +602,6 @@ def known_projects(layout: Layout, log: Optional[Log] = None,
             log.warn(f"state dir {name} holds {len(memory_files(state))} memory "
                      f"file(s) but no matching project directory exists here")
     return found
-
-
-def kept_state(state: str, paths: Iterable[str],
-               entries: Container[str], counts: Container[str]) -> bool:
-    """Whether Claude has actually filed anything under this project.
-
-    `known_projects` promotes every cwd a transcript ever recorded to a
-    project path and maps it to the state directory it *would* have.  Most are
-    not projects: a subdirectory someone cd'd into for one command, one of
-    Claude Code's own worktrees under a project's .claude/, a name a folder
-    wore for an afternoon before being renamed.
-
-    A command that reports or deletes what this machine is keeping must not
-    count those -- there is nothing filed under them to report or delete, and
-    counting them claims more projects than ~/.claude/projects holds.  The
-    move path deliberately keeps them, which is why this narrows at the
-    consumer rather than inside `known_projects`: a session that ran in a
-    subdirectory really does have a scratchpad filed under that
-    subdirectory's encoded name, and a rewrite that skipped it would strand
-    the path it names.
-
-    Blobs need no test of their own: they hang off session ids read out of a
-    state directory, so a project without one has none.  `entries` and
-    `counts` are membership-tested rather than read -- the maps behind them
-    only ever hold a non-empty list and a count of at least one.
-    """
-    return (os.path.isdir(state)
-            or any(path in entries or path in counts for path in paths))
 
 
 def cwds_in_state_dir(state_dir: str) -> Set[str]:
@@ -1450,6 +1422,58 @@ def copy_state_dir(src: str, dst: str, parts: Parts) -> None:
             raise OSError(f"could not copy {source}: {exc}")
 
 
+class Filed:
+    """What ~/.claude.json and the shell history hold for each project.
+
+    Read once, because three commands ask and both files are big: ~/.claude.json
+    is routinely megabytes, and `history_entries` builds a tuple per line of the
+    history.  The same read answers all three questions asked of it -- whether
+    anything is filed under a project at all, the config keyed as it is actually
+    written, and how many history lines a project owns -- so they cannot drift
+    apart either.
+    """
+
+    def __init__(self, layout: Layout, config: Any = None) -> None:
+        self.config = read_json(layout.config, {}) if config is None else config
+        # keyed as it is actually written, so an entry is removed by the key it
+        # has rather than by the normalised form we compare on
+        self.entries: Dict[str, List[str]] = {}
+        for key in config_projects(self.config):
+            self.entries.setdefault(norm(key), []).append(key)
+        # project path -> how many lines of the shell history it owns
+        self.counts: Dict[str, int] = {}
+        for _line, project in history_entries(layout):
+            if project:
+                self.counts[project] = self.counts.get(project, 0) + 1
+
+    def keeps(self, state: str, paths: Iterable[str]) -> bool:
+        """Whether Claude has actually filed anything under this project.
+
+        `known_projects` promotes every cwd a transcript ever recorded to a
+        project path and maps it to the state directory it *would* have.  Most
+        are not projects: a subdirectory someone cd'd into for one command, one
+        of Claude Code's own worktrees under a project's .claude/, a name a
+        folder wore for an afternoon before being renamed.
+
+        A command that reports or deletes what this machine is keeping must not
+        count those -- there is nothing filed under them to report or delete,
+        and counting them claims more projects than ~/.claude/projects holds.
+        The move path deliberately keeps them, which is why this narrows at the
+        consumer rather than inside `known_projects`: a session that ran in a
+        subdirectory really does have a scratchpad filed under that
+        subdirectory's encoded name, and a rewrite that skipped it would strand
+        the path it names.
+
+        Blobs need no test of their own: they hang off session ids read out of
+        a state directory, so a project without one has none.  `entries` and
+        `counts` are membership-tested rather than read -- they only ever hold
+        a non-empty list and a count of at least one.
+        """
+        return (os.path.isdir(state)
+                or any(path in self.entries or path in self.counts
+                       for path in paths))
+
+
 def history_entries(layout: Layout) -> List[Tuple[str, Optional[str]]]:
     """Every line of ~/.claude/history.jsonl, paired with the project it names.
 
@@ -2254,7 +2278,10 @@ class Relocations:
         # one scan of every transcript, whose cwd sets and resolved project
         # list are both needed below
         self.cwds: Dict[str, Set[str]] = {}
-        self.projects = known_projects(layout, log, self.cwds)
+        # what Claude has filed, read once here: `_destination` needs it below
+        # and prune needs it again, and both files behind it are big
+        self.filed = Filed(layout)
+        self.projects = known_projects(layout, log, self.cwds, self.filed.config)
         self._claimants: Dict[str, Set[str]] = {}
         for path, state in self.projects.items():
             self._claimants.setdefault(state, set()).add(path)
@@ -2270,10 +2297,8 @@ class Relocations:
         # `here` itself stays wide: `index` uses it to stop the home search
         # descending into a project, and a cwd inside one is exactly where
         # that search should stop.
-        entries = {norm(key) for key in config_projects(read_json(layout.config, {}))}
-        counts = {project for _line, project in history_entries(layout) if project}
         kept = {p for p in self.here
-                if kept_state(self.projects[p], (p,), entries, counts)}
+                if self.filed.keeps(self.projects[p], (p,))}
         self.by_name: Dict[str, Set[str]] = {}
         for path in self.here:
             if self._destination(path, kept):
@@ -2838,21 +2863,13 @@ class Prune:
         self.orphans: List[Orphan] = []
         self.moved: List[Clue] = []
         self.checked = 0
-        # the config keyed as it is actually written, so an entry is removed by
-        # the key it has rather than by the normalised form we compare on
-        self.entries: Dict[str, List[str]] = {}
-        for key in config_projects(read_json(layout.config, {})):
-            self.entries.setdefault(norm(key), []).append(key)
+        # already read while the relocations were worked out
+        self.filed = self.relocations.filed
         # session id -> its folder of /rewind blobs.  Every state directory
         # asks this the same question, and the answer does not change between
         # them; looking it up per directory rescans the whole tree each time.
         self.blob_dirs: Dict[str, str] = {
             os.path.basename(d): d for d in file_history_dirs(layout)}
-        # project path -> how many lines of the shell history it owns
-        self.counts: Dict[str, int] = {}
-        for _line, project in history_entries(layout):
-            if project:
-                self.counts[project] = self.counts.get(project, 0) + 1
 
     # -- scanning ---------------------------------------------------------
 
@@ -2864,7 +2881,7 @@ class Prune:
             candidates.setdefault(state, set()).add(path)
 
         for state in sorted(candidates):
-            if not kept_state(state, candidates[state], self.entries, self.counts):
+            if not self.filed.keeps(state, candidates[state]):
                 continue
             self.checked += 1
             orphan = self._examine(state, candidates[state])
@@ -2913,8 +2930,8 @@ class Prune:
 
         orphan = Orphan(owners, state if os.path.isdir(state) else None)
         for path in orphan.paths:
-            orphan.config.extend(self.entries.get(path, []))
-            orphan.history += self.counts.get(path, 0)
+            orphan.config.extend(self.filed.entries.get(path, []))
+            orphan.history += self.filed.counts.get(path, 0)
         orphan.blobs = [self.blob_dirs[sid] for sid in orphan.sessions
                         if sid in self.blob_dirs]
         return orphan
@@ -3251,11 +3268,10 @@ def expand_sources(patterns: Iterable[str], projects: Set[str],
 
 
 def cmd_list(layout: Layout, log: Log) -> int:
-    known = known_projects(layout)
-    entries = {norm(key) for key in config_projects(read_json(layout.config, {}))}
-    counts = {project for _line, project in history_entries(layout) if project}
+    filed = Filed(layout)
+    known = known_projects(layout, config=filed.config)
     projects = sorted(path for path, state in known.items()
-                      if kept_state(state, (path,), entries, counts))
+                      if filed.keeps(state, (path,)))
     if not projects:
         log.info("no Claude Code projects found")
         return 0
