@@ -2260,8 +2260,10 @@ class Relocations:
       1. a state directory naming a path that no longer exists while exactly
          one path it could belong to does -- Claude's own state proves the
          move, so this one is certain;
-      2. a missing path whose last segment names a project that still exists
-         somewhere else;
+      2. a missing path whose last segment names exactly one directory
+         Claude already knows that is still on disk -- somewhere a project
+         could have moved to, which is not the same as somewhere Claude has
+         filed a project;
       3. a missing path whose last segment names exactly one directory found
          under the home directory.
 
@@ -2446,7 +2448,7 @@ class Relocations:
         hits = self.by_name.get(os.path.basename(path), set()) - {path}
         if len(hits) == 1:
             return Clue(path, hits.pop(),
-                        "the only project Claude knows by that name", False)
+                        "the only directory Claude knows by that name", False)
         return None
 
     def _searched(self, path: str) -> Optional[Clue]:

@@ -322,7 +322,7 @@ class RepairTest(unittest.TestCase):
         code, out = self.m.repair("-n")
         self.assertEqual(code, 0, out)
         self.assertIn("(a guess)", out)
-        self.assertIn("the only project Claude knows by that name", out)
+        self.assertIn("the only directory Claude knows by that name", out)
         self.assertIn(here, out.replace("~", self.home))
 
     def test_a_directory_found_by_search_is_offered_as_a_guess(self):

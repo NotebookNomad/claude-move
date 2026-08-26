@@ -301,10 +301,10 @@ class PruneTest(unittest.TestCase):
         self.assertIn("Checked 3 project(s)", out)
 
     def test_a_subdirectory_is_not_offered_as_where_a_project_went(self):
-        """`by_name` is the source for "the only project Claude knows by that
-        name".  A cwd is not a project, so a scratch directory inside a live
-        one must not become the proposed new home of a missing project that
-        happens to share its last segment -- prune would refuse to delete
+        """`by_name` is the source for "the only directory Claude knows by
+        that name".  A cwd is not a project, so a scratch directory inside a
+        live one must not become the proposed new home of a missing project
+        that happens to share its last segment -- prune would refuse to delete
         state on the strength of it, and repair would rewrite paths to it."""
         api = self.m.alive("dev/api", session="s-1")
         self.m.record_cwd(api, "s-1", self.make_dir("dev/api/workspace"))
