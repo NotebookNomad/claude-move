@@ -313,8 +313,71 @@ class PruneTest(unittest.TestCase):
         code, out = self.m.prune("-n", "--no-search")
         self.assertEqual(code, 0, out)
         self.assertNotIn("Moved rather than deleted", out)
-        self.assertNotIn(self.path("dev/api/workspace"), out)
+        # prune prints every path tilde-folded, so the absolute form could
+        # never appear here however wrong the answer was
+        self.assertNotIn("~/dev/api/workspace", out)
+        self.assertIn("Gone from disk", out)
         self.assertIn("elsewhere/workspace", out)
+
+    def test_a_worktree_is_not_offered_as_where_a_project_went(self):
+        """Claude Code writes a config entry for every directory it is opened
+        in, its own worktrees under ~/.claude included.  Something is filed
+        under one, so only the `.claude` in the path tells it from a project."""
+        self.m.alive("dev/api", session="s-1")
+        self.make_dir(".claude/worktrees/spike")
+        self.m.config_only(".claude/worktrees/spike")
+        self.m.gone("elsewhere/spike", session="s-2")
+
+        code, out = self.m.prune("-n", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Moved rather than deleted", out)
+        self.assertNotIn("worktrees/spike", out)
+        self.assertIn("Gone from disk", out)
+
+    def test_a_worktree_inside_a_project_is_not_offered_either(self):
+        """The same worktree one level down, where Claude Code really does put
+        them: a state directory and sessions of its own, from running there."""
+        self.m.alive("dev/api", session="s-1")
+        self.m.alive("dev/api/.claude/worktrees/feat", session="s-3")
+        self.m.gone("elsewhere/feat", session="s-2")
+
+        code, out = self.m.prune("-n", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Moved rather than deleted", out)
+        self.assertNotIn("worktrees/feat", out)
+        self.assertIn("Gone from disk", out)
+
+    def test_a_subdirectory_sharing_a_siblings_encoded_name(self):
+        """encode_path is lossy: ~/dev/api/workspace and ~/dev/api-workspace
+        name the same state directory.  A scratch directory must not be
+        readmitted because its sibling's state dir happens to sit where its
+        own would."""
+        api = self.m.alive("dev/api", session="s-1")
+        self.m.record_cwd(api, "s-1", self.make_dir("dev/api/workspace"))
+        self.m.alive("dev/api-workspace", session="s-3")
+        self.m.gone("elsewhere/workspace", session="s-2")
+
+        code, out = self.m.prune("-n", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Moved rather than deleted", out)
+        self.assertNotIn("~/dev/api/workspace", out)
+        self.assertIn("Gone from disk", out)
+
+    def test_a_folder_moved_by_hand_still_stops_a_delete(self):
+        """The other direction.  A folder moved by hand and not reopened has
+        nothing filed under its new path -- Claude knows it only as a cwd
+        another project's transcript recorded.  That is still enough to stop
+        prune deleting the state of a project sitting right there."""
+        other = self.m.alive("dev/other", session="s-9")
+        self.m.record_cwd(other, "s-9", self.make_dir("dev/api"))
+        gone = self.m.gone("old/api", session="s-2", memory={"n.md": "x\n"})
+        state = self.m.state(gone)
+
+        code, out = self.m.prune("-y", "--no-search")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Moved rather than deleted", out)
+        self.assertIn("~/old/api  ->  ~/dev/api", out)
+        self.assertTrue(os.path.isdir(state), out)
 
     def test_naming_one_project_never_reaches_another(self):
         """A cwd recorded inside a transcript can name a different project.

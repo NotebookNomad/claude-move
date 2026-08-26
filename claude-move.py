@@ -2248,25 +2248,52 @@ class Relocations:
         for path, state in self.projects.items():
             self._claimants.setdefault(state, set()).add(path)
         self.here = {p for p in self.projects if os.path.isdir(p)}
-        # Somewhere a project could have moved *to* has to be a project
-        # itself.  `known_projects` also hands back every cwd a transcript
-        # recorded, so without this a scratch directory inside a live project
-        # -- or one of Claude Code's own worktrees -- can be offered as the
-        # new home of a missing project that shares its last segment, on the
-        # strength of nothing but the name.  prune then refuses to delete
-        # state because of it, and repair rewrites paths to it.
+        # Somewhere a project could have moved *to* has to look like one.
+        # `known_projects` also hands back every cwd a transcript recorded, so
+        # without this a scratch directory inside a live project -- or one of
+        # Claude Code's own worktrees -- can be offered as the new home of a
+        # missing project that shares its last segment, on the strength of
+        # nothing but the name.  prune then refuses to delete state because of
+        # it, and repair rewrites paths to it.
         #
         # `here` itself stays wide: `index` uses it to stop the home search
         # descending into a project, and a cwd inside one is exactly where
         # that search should stop.
         entries = {norm(key) for key in config_projects(read_json(layout.config, {}))}
         counts = {project for _line, project in history_entries(layout) if project}
+        kept = {p for p in self.here
+                if kept_state(self.projects[p], (p,), entries, counts)}
         self.by_name: Dict[str, Set[str]] = {}
         for path in self.here:
-            if kept_state(self.projects[path], (path,), entries, counts):
+            if self._destination(path, kept):
                 self.by_name.setdefault(os.path.basename(path), set()).add(path)
         self._index: Optional[Dict[str, Set[str]]] = None
         self._from_state_dirs()
+
+    def _destination(self, path: str, kept: Set[str]) -> bool:
+        """Whether a path is somewhere a project could have moved *to*.
+
+        The same question `index` answers as it walks, asked of a path already
+        in hand: not inside an application's private state, and not inside
+        another project.  Both sources of a guess have to agree on it, or the
+        one this rejects the other still offers.
+
+        The test is the shape of the path, not what Claude has filed under it.
+        Claude Code files a worktree exactly the way it files a project -- a
+        state directory and a config entry, because it ran there -- so what is
+        filed cannot tell the two apart, while the `.claude` in the path can.
+        Asking what is filed also gets the honest case backwards: a folder
+        moved by hand and not yet reopened has nothing filed under its new
+        path either, and dropping it leaves prune deleting the state of a
+        project sitting right there.
+
+        `kept` is the projects something is actually filed under rather than
+        every path in `here`, so that a directory someone cd'd into once does
+        not disqualify the projects beneath it.
+        """
+        return (not any(part.startswith(".")
+                        for part in path.strip("/").split("/"))
+                and not any(a in kept for a in ancestors(path)[1:]))
 
     # -- evidence ---------------------------------------------------------
 
