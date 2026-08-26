@@ -1303,7 +1303,18 @@ class Batch:
 
 
 def short(path: str, home: str) -> str:
-    """A path with its home directory folded to ~, for display."""
+    """A path with its home directory folded to ~, for display.
+
+    The home directory itself folds too.  `tilde` will not do that -- it
+    answers whether a path is *under* home, and `project_pairs` turns its
+    answer into a rewrite rule, where a `~` standing for the whole home
+    directory would match far more than it should.  Displaying a path is the
+    one place that distinction does not matter, and printing an absolute
+    /Users/<name> in output that folds every other path is both inconsistent
+    and more than the reader asked to share.
+    """
+    if path == home:
+        return "~"
     return tilde(path, home) or path
 
 

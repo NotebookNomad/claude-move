@@ -379,6 +379,20 @@ class PruneTest(unittest.TestCase):
         self.assertIn("~/old/api  ->  ~/dev/api", out)
         self.assertTrue(os.path.isdir(state), out)
 
+    def test_the_search_says_where_it_looked_without_naming_home(self):
+        """The clue the home search produces names the directory it searched.
+        Every other path prune prints is tilde-folded, and the home directory
+        is the one path `tilde` refuses to fold -- so this line used to print
+        an absolute /Users/<name> in the middle of output that folds
+        everything else."""
+        self.make_dir("found/thing")          # on disk, unknown to Claude
+        self.m.gone("elsewhere/thing", session="s-2")
+
+        code, out = self.m.prune("-n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("the only directory by that name under ~", out)
+        self.assertNotIn(self.home, out)
+
     def test_naming_one_project_never_reaches_another(self):
         """A cwd recorded inside a transcript can name a different project.
 
